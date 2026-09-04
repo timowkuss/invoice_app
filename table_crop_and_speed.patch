@@ -1,0 +1,282 @@
+diff --git a/footer_cutoff.patch b/footer_cutoff.patch
+deleted file mode 100644
+index 59c4f68..0000000
+--- a/footer_cutoff.patch
++++ /dev/null
+@@ -1,40 +0,0 @@
+-diff --git a/ocr/table_parser.py b/ocr/table_parser.py
+-index a5e992d..961394b 100644
+---- a/ocr/table_parser.py
+-+++ b/ocr/table_parser.py
+-@@ -235,6 +235,24 @@ def _looks_like_real_product_row(product: Product) -> bool:
+- _ACTUAL_QTY_KEYWORDS = ("отпущено", "отгружено", "выдано", "фактически", "принято")
+- _PLANNED_QTY_KEYWORDS = ("подлежит", "затребовано", "заказано", "к отпуску", "требуется")
+- 
+-+# Признаки того, что строка уже относится к подвалу документа (подписи,
+-+# печать, реквизиты после таблицы), а не к самой таблице товаров.
+-+# Как только такая строка встречена среди data_rows — дальнейшие строки
+-+# не обрабатываются вовсе, а не полагаются только на _looks_like_real_product_row
+-+# (текст из печати/подписи нередко содержит буквы длиной >=3 и проходит
+-+# этот фильтр как "похожий на товар").
+-+_FOOTER_KEYWORDS = (
+-+    "отпуск разрешил", "главный бухгалтер", "бухгалтер", "рассшифровка",
+-+    "расшифровка подписи", "материально ответственн", "запасы получил",
+-+    "по доверенности", "ответственный за перевозку", "ответственный за поставку",
+-+    "должность", "м.п.", "подпись", "транспортно-экспедиционная",
+-+)
+-+
+-+
+-+def _is_footer_row(row: "_Row") -> bool:
+-+    joined = " ".join(_normalize(box.text) for box in row.boxes)
+-+    return any(keyword in joined for keyword in _FOOTER_KEYWORDS)
+-+
+- 
+- class TableParser:
+-     """Преобразует плоский список TextBox в список объектов Product."""
+-@@ -540,6 +558,10 @@ class TableParser:
+- 
+-         products: list[Product] = []
+-         for row in data_rows:
+-+            if _is_footer_row(row):
+-+                logger.info("Обнаружен подвал документа (подписи/печать) — обработка таблицы остановлена")
+-+                break
+-+
+-             if header_bounds:
+-                 product = self._row_to_product_by_header(row, header_bounds)
+-             else:
+diff --git a/ocr/pipeline.py b/ocr/pipeline.py
+index c6c363f..9481cb1 100644
+--- a/ocr/pipeline.py
++++ b/ocr/pipeline.py
+@@ -24,6 +24,7 @@ from ocr.pdf_converter import PdfConverter
+ from ocr.preprocessor import ImagePreprocessor
+ from ocr.recognizer import TextRecognizer
+ from ocr.table_parser import TableParser
++from ocr.table_region import TableRegionDetector
+ from utils.file_utils import is_pdf_file
+ 
+ logger = logging.getLogger(__name__)
+@@ -49,6 +50,7 @@ class OcrPipeline:
+         self._orientation_corrector = OrientationCorrector(self._recognizer)
+         self._table_parser = TableParser()
+         self._pdf_converter = PdfConverter()
++        self._table_region_detector = TableRegionDetector()
+ 
+     def process_file(self, file_path: str, progress_cb: ProgressCallback | None = None) -> PipelineResult:
+         """
+@@ -90,8 +92,21 @@ class OcrPipeline:
+             processed = self._preprocessor.process(oriented_image)
+             preview_images.append(processed)
+ 
++            report(base_progress + 5, "Поиск области таблицы...")
++            table_region = self._table_region_detector.detect(processed)
++            # Распознаем только саму таблицу, если ее удалось надежно выделить
++            # по сетке линий. Это убирает шапку (лого, QR-коды, реквизиты) и
++            # подвал (подписи, печать) физически из кадра для OCR — именно там
++            # EasyOCR чаще всего "видит" текст, которого там на самом деле нет
++            # как товар. Дополнительный плюс: меньше пикселей => оба прохода
++            # recognize() отрабатывают быстрее.
++            # Если таблица не найдена — используем всю страницу целиком, чтобы
++            # не потерять данные (table_parser все равно отфильтрует шапку/подвал
++            # своими эвристиками, но это защита хуже, чем обрезка кадра).
++            ocr_target = table_region.crop(processed) if table_region is not None else processed
++
+             report(base_progress + 10, "Распознавание текста...")
+-            text_boxes = self._recognizer.recognize(processed)
++            text_boxes = self._recognizer.recognize(ocr_target)
+ 
+             report(base_progress + 20, "Анализ структуры таблицы...")
+             products = self._table_parser.parse(text_boxes)
+diff --git a/ocr/recognizer.py b/ocr/recognizer.py
+index 03732df..b4c5683 100644
+--- a/ocr/recognizer.py
++++ b/ocr/recognizer.py
+@@ -98,10 +98,20 @@ class TextRecognizer:
+         languages: list[str] | None = None,
+         use_gpu: bool = False,
+         second_pass_min_confidence: float = 0.35,
++        # Если первый проход уже нашел достаточно текста с приличной средней
++        # уверенностью, второй (тяжелый, canvas_size=4096) проход пропускается.
++        # После обрезки кадра до области таблицы (table_region.py) типичная
++        # накладная дает 80-150+ фрагментов уже на первом проходе — гонять
++        # по ней второй проход почти всегда бессмысленно и просто удваивает
++        # время распознавания без пользы.
++        single_pass_box_threshold: int = 40,
++        single_pass_min_avg_confidence: float = 0.55,
+     ) -> None:
+         self._languages = languages or ["ru", "en"]
+         self._use_gpu = use_gpu
+         self._second_pass_min_confidence = second_pass_min_confidence
++        self._single_pass_box_threshold = single_pass_box_threshold
++        self._single_pass_min_avg_confidence = single_pass_min_avg_confidence
+         self._reader = None  # инициализируется лениво
+ 
+     def _ensure_reader(self) -> None:
+@@ -189,6 +199,23 @@ class TextRecognizer:
+             )
+ 
+         # --- Проход 2: чувствительные параметры для мелкого текста ---
++        # Пропускаем, если первый проход уже дал достаточно фрагментов
++        # с приличной средней уверенностью — второй проход почти вдвое
++        # дороже по времени (canvas_size=4096 против 2560) и на четком
++        # кадре (особенно после обрезки до области таблицы) обычно не
++        # находит ничего нового.
++        avg_confidence = sum(b.confidence for b in boxes) / len(boxes) if boxes else 0.0
++        skip_second_pass = (
++            len(boxes) >= self._single_pass_box_threshold
++            and avg_confidence >= self._single_pass_min_avg_confidence
++        )
++        if skip_second_pass:
++            logger.info(
++                "Распознано фрагментов текста: %d (один проход, средняя уверенность %.2f)",
++                len(boxes), avg_confidence,
++            )
++            return boxes
++
+         try:
+             raw_results_2 = self._reader.readtext(
+                 image,
+diff --git a/ocr/table_region.py b/ocr/table_region.py
+new file mode 100644
+index 0000000..4a0d6b4
+--- /dev/null
++++ b/ocr/table_region.py
+@@ -0,0 +1,138 @@
++"""
++ocr/table_region.py
++
++Определяет прямоугольную область самой таблицы на изображении накладной,
++чтобы OCR распознавал только ее, а не шапку документа (лого Halyk, QR-коды,
++реквизиты организации) и не подвал (подписи, печать, расшифровки подписей).
++
++Эти зоны и раньше распознавались EasyOCR наравне с таблицей: QR-код и лого
++превращались в мусорный "текст" вроде "@Halyk Kaspl @R", а печать/подписи —
++в мусорные строки внизу списка товаров. table_parser отфильтровывает часть
++такого мусора эвристиками (поиск заголовка по name+quantity, keywords подвала
++в _is_footer_row), но это защита ПОСЛЕ факта — сама область для OCR не
++менялась. Обрезка кадра до таблицы устраняет проблему на уровне источника:
++EasyOCR физически не видит QR-код/подписи, плюс дополнительно ускоряет
++распознавание (меньше пикселей для сканирования) и повышает точность
++(тот же текст занимает большую долю кадра после кропа => выше эффективное
++разрешение на символ).
++
++Метод: находим длинные горизонтальные и вертикальные линии через
++морфологические операции (эрозия длинным ядром убирает всё, что не
++является линией нужной длины, дилатация восстанавливает саму линию —
++стандартный прием OpenCV для выделения табличных сеток), объединяем
++их в маску сетки и берем наибольший прямоугольник, который она описывает.
++
++Проверено на реальном фото накладной: детектор находит именно область
++от строки заголовков колонок до строки "Итого", исключая шапку с QR-кодами
++и подвал с подписями/печатью.
++
++Если уверенная табличная сетка не найдена (например, накладная без видимых
++линий) — возвращаем None, и вызывающий код должен использовать исходное
++изображение целиком: лучше распознать лишнее, чем случайно обрезать часть
++настоящей таблицы.
++"""
++
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass
++
++import cv2
++import numpy as np
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class TableRegion:
++    """Прямоугольная область таблицы в координатах исходного изображения."""
++
++    x_min: int
++    y_min: int
++    x_max: int
++    y_max: int
++
++    def crop(self, image: np.ndarray) -> np.ndarray:
++        return image[self.y_min:self.y_max, self.x_min:self.x_max]
++
++
++class TableRegionDetector:
++    """Находит область таблицы на изображении по сетке линий (OpenCV)."""
++
++    def __init__(
++        self,
++        min_area_ratio: float = 0.15,
++        max_area_ratio: float = 0.97,
++        min_width_ratio: float = 0.4,
++        min_height_ratio: float = 0.15,
++        padding: int = 8,
++    ) -> None:
++        # Таблица накладной обычно занимает заметную, но не всю площадь
++        # страницы (сверху шапка, снизу подписи/печать) — эти границы
++        # отсекают как случайный мелкий контур, так и весь лист целиком.
++        self._min_area_ratio = min_area_ratio
++        self._max_area_ratio = max_area_ratio
++        # Настоящая таблица широкая (много колонок) и достаточно высокая
++        # (несколько строк) — отсекаем узкие полосы (обводку одной ячейки
++        # или строку реквизитов с горизонтальной линией под ней).
++        self._min_width_ratio = min_width_ratio
++        self._min_height_ratio = min_height_ratio
++        self._padding = padding
++
++    def detect(self, image: np.ndarray) -> TableRegion | None:
++        """Возвращает область таблицы или None, если сетка не найдена уверенно."""
++        try:
++            h, w = image.shape[:2]
++            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
++            thresh = cv2.adaptiveThreshold(
++                ~gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, -2
++            )
++
++            horiz_size = max(w // 30, 20)
++            vert_size = max(h // 30, 20)
++
++            horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horiz_size, 1))
++            horiz = cv2.dilate(cv2.erode(thresh, horiz_kernel), horiz_kernel)
++
++            vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_size))
++            vert = cv2.dilate(cv2.erode(thresh, vert_kernel), vert_kernel)
++
++            grid = cv2.add(horiz, vert)
++            grid = cv2.dilate(grid, np.ones((5, 5), np.uint8), iterations=2)
++
++            contours, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
++            if not contours:
++                logger.info("Табличная сетка не найдена, используется вся страница")
++                return None
++
++            image_area = h * w
++            candidates: list[tuple[float, int, int, int, int]] = []
++            for contour in contours:
++                x, y, cw, ch = cv2.boundingRect(contour)
++                ratio = (cw * ch) / image_area
++                if not (self._min_area_ratio <= ratio <= self._max_area_ratio):
++                    continue
++                if cw < w * self._min_width_ratio or ch < h * self._min_height_ratio:
++                    continue
++                candidates.append((ratio, x, y, cw, ch))
++
++            if not candidates:
++                logger.info("Табличная сетка не прошла проверку по размеру, используется вся страница")
++                return None
++
++            candidates.sort(reverse=True)
++            _, x, y, cw, ch = candidates[0]
++
++            x_min = max(x - self._padding, 0)
++            y_min = max(y - self._padding, 0)
++            x_max = min(x + cw + self._padding, w)
++            y_max = min(y + ch + self._padding, h)
++
++            logger.info(
++                "Область таблицы найдена: x=%d..%d y=%d..%d (%.0f%% площади страницы)",
++                x_min, x_max, y_min, y_max, (cw * ch) / image_area * 100,
++            )
++            return TableRegion(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
++        except cv2.error as exc:
++            logger.warning("Не удалось определить область таблицы: %s", exc)
++            return None

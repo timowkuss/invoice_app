@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Invoice App</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="app">
+        <nav class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <h2>Invoice App</h2>
+                <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
+            </div>
+            <ul class="nav-links">
+                <li><a href="#" onclick="showPage('dashboard')" class="active" data-page="dashboard">📊 Dashboard</li>
+                <li><a href="#" onclick="showPage('documents')" data-page="documents">📄 Накладные</li>
+                <li><a href="#" onclick="showPage('products')" data-page="products">📦 Товары</li>
+                <li><a href="#" onclick="showPage('users')" data-page="users">👥 Пользователи</li>
+                <li><a href="#" onclick="showPage('stores')" data-page="stores">🏪 Магазины</li>
+                <li><a href="#" onclick="showPage('aliases')" data-page="aliases">🔗 Синонимы</li>
+                <li><a href="#" onclick="showPage('ai-stats')" data-page="ai-stats">🤖 Mistral Статистика</li>
+                <li><a href="#" onclick="showPage('settings')" data-page="settings">⚙️ Настройки</li>
+            </ul>
+            <div class="sidebar-footer">
+                <span id="user-info"></span>
+                <button onclick="logout()">Выйти</button>
+            </div>
+        </nav>
+
+        <main class="content">
+            <div id="page-dashboard" class="page active"></div>
+            <div id="page-documents" class="page"></div>
+            <div id="page-document-detail" class="page"></div>
+            <div id="page-products" class="page"></div>
+            <div id="page-users" class="page"></div>
+            <div id="page-stores" class="page"></div>
+            <div id="page-aliases" class="page"></div>
+            <div id="page-ai-stats" class="page"></div>
+            <div id="page-settings" class="page"></div>
+            <div id="page-login" class="page active"></div>
+        </main>
+    </div>
+
+    <div id="modal-overlay" class="modal-overlay" onclick="closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3 id="modal-title"></h3>
+                <button onclick="closeModal()">✕</button>
+            </div>
+            <div id="modal-content"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
