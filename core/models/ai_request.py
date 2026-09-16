@@ -14,6 +14,7 @@ class AiRequest:
     model: str = "mistral-ocr-latest"
     request_type: str = "ocr"  # ocr, matching, other
     status: str = "success"  # success, error, timeout
+    pages: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -32,6 +33,7 @@ class AiRequest:
             "model": self.model,
             "request_type": self.request_type,
             "status": self.status,
+            "pages": self.pages,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
@@ -52,6 +54,7 @@ class AiRequest:
             model=row.get("model", "mistral-ocr-latest"),
             request_type=row.get("request_type", "ocr"),
             status=row.get("status", "success"),
+            pages=row.get("pages", 0),
             input_tokens=row.get("input_tokens", 0),
             output_tokens=row.get("output_tokens", 0),
             total_tokens=row.get("total_tokens", 0),

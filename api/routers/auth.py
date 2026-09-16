@@ -1,32 +1,48 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import logging
 import os
+import secrets
 import time
-import uuid
+from datetime import datetime, timedelta
+from urllib.parse import urlencode
 from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, Field
-from core.auth import AuthService, decode_access_token, hash_password
+from pydantic import BaseModel, Field, field_validator
+from core.auth import AuthService, decode_access_token, hash_password, normalize_email
 from core.database import get_transaction
 from core.repositories import UserRepo, StoreRepo
 from core.models.user import User
-from core.models.store import Store
+from core import mailer
 
 router = APIRouter()
 
 class LoginRequest(BaseModel):
-    username: str = Field(min_length=3, max_length=100, pattern=r'^[a-zA-Z0-9_.@-]+$')
+    email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=1, max_length=72)
 
-class SignupRequest(LoginRequest):
-    store_name: str = Field(min_length=2, max_length=255)
-    full_name: str = Field(default='', max_length=255)
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        return normalize_email(value)
 
 class RegisterRequest(LoginRequest):
     full_name: str = Field(default='', max_length=255)
-    role: Literal['operator', 'store_admin', 'super_admin'] = 'operator'
+    role: Literal['operator', 'store_admin'] = 'operator'
     store_id: int | None = None
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        return normalize_email(value)
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=200)
+    password: str = Field(min_length=10, max_length=72)
 
 async def throttle(request: Request, action: str):
     # Persistent counters work across processes. Never trust forwarded headers here.
@@ -81,27 +97,49 @@ def session_response(response, user, token):
 async def login(req: LoginRequest, request: Request, response: Response):
     await throttle(request, 'login')
     try:
-        user, token = await AuthService.login(req.username.lower(), req.password)
+        user, token = await AuthService.login(req.email, req.password)
     except ValueError:
-        raise HTTPException(401, 'Неверный логин или пароль')
+        raise HTTPException(401, 'Неверный email или пароль')
     return session_response(response, user, token)
 
-@router.post('/signup', status_code=201)
-async def signup(req: SignupRequest, request: Request, response: Response):
-    await throttle(request, 'signup')
-    if os.getenv('ALLOW_SIGNUP','true').lower() != 'true':
-        raise HTTPException(403, 'Регистрация через владельца сервиса')
-    try:
-        password_hash = await asyncio.to_thread(hash_password, req.password)
-        async with get_transaction():
-            if await UserRepo.get_by_username(req.username.lower()):
-                raise HTTPException(409, 'Этот логин уже занят')
-            store = await StoreRepo.create(Store(name=req.store_name.strip(), code=uuid.uuid4().hex[:16]))
-            user = await UserRepo.create(User(username=req.username.lower(), password_hash=password_hash, full_name=req.full_name, role='store_admin', store_id=store.id))
-    except ValueError as exc:
-        raise HTTPException(422, str(exc))
-    from core.auth import create_access_token
-    return session_response(response, user, create_access_token(user.id, user.role, user.store_id))
+@router.post('/forgot-password')
+async def forgot_password(req: ForgotPasswordRequest, request: Request):
+    await throttle(request, 'password-reset')
+    if not mailer.is_configured():
+        raise HTTPException(503, 'Восстановление пароля пока не настроено. Обратитесь к администратору.')
+    user = await UserRepo.get_by_email(req.email)
+    if user and user.is_active:
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        expires_at = datetime.utcnow() + timedelta(minutes=30)
+        async with get_transaction() as conn:
+            await conn.execute('DELETE FROM password_reset_tokens WHERE user_id=$1 AND used_at IS NULL', user.id)
+            await conn.execute(
+                'INSERT INTO password_reset_tokens (user_id,token_hash,expires_at) VALUES ($1,$2,$3)',
+                user.id, token_hash, expires_at,
+            )
+        reset_url = f"{os.getenv('WEB_URL','http://localhost:8000').rstrip('/')}/?{urlencode({'reset_token': token})}"
+        try:
+            await asyncio.to_thread(mailer.send_password_reset_email, req.email, reset_url)
+        except Exception:
+            logging.getLogger(__name__).exception('Password reset email delivery failed')
+    return {'message': 'Если такой email зарегистрирован, мы отправили ссылку для сброса пароля.'}
+
+@router.post('/reset-password')
+async def reset_password(req: ResetPasswordRequest, request: Request):
+    await throttle(request, 'password-reset-confirm')
+    token_hash = hashlib.sha256(req.token.encode()).hexdigest()
+    password_hash = await asyncio.to_thread(hash_password, req.password)
+    async with get_transaction() as conn:
+        row = await conn.fetchrow(
+            'SELECT id,user_id FROM password_reset_tokens WHERE token_hash=$1 AND used_at IS NULL AND expires_at>$2',
+            token_hash, datetime.utcnow(),
+        )
+        if not row:
+            raise HTTPException(400, 'Ссылка недействительна или срок её действия истёк')
+        await UserRepo.set_password(row['user_id'], password_hash)
+        await conn.execute('UPDATE password_reset_tokens SET used_at=NOW() WHERE id=$1', row['id'])
+    return {'message': 'Пароль изменён. Теперь можно войти.'}
 
 @router.post('/logout')
 async def logout(response: Response):
@@ -113,15 +151,13 @@ async def me(user: User = Depends(get_current_user)):
     return user.to_dict()
 
 @router.post('/register', status_code=201)
-async def register(req: RegisterRequest, admin: User = Depends(require_admin)):
-    if not admin.is_super_admin and (req.role == 'super_admin' or req.store_id not in (None, admin.store_id)):
-        raise HTTPException(403, 'Нельзя назначить эти права или другой магазин')
-    store_id = req.store_id if admin.is_super_admin else admin.store_id
-    if req.role != 'super_admin' and not store_id:
+async def register(req: RegisterRequest, admin: User = Depends(require_super_admin)):
+    store_id = req.store_id
+    if not store_id:
         raise HTTPException(422, 'Укажите магазин')
     if store_id and not await StoreRepo.get_by_id(store_id):
         raise HTTPException(404, 'Магазин не найден')
     try:
-        return (await AuthService.register(req.username.lower(), req.password, req.full_name, req.role, store_id)).to_dict()
+        return (await AuthService.register(req.email, req.password, req.full_name, req.role, store_id)).to_dict()
     except ValueError as exc:
         raise HTTPException(409, str(exc))

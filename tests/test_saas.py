@@ -20,13 +20,23 @@ def client(tmp_path,monkeypatch):
     monkeypatch.setenv('SECRET_KEY','test-secret-'*5)
     monkeypatch.setenv('OCR_WORKER','false')
     monkeypatch.setenv('MISTRAL_API_KEY','test-only')
+    monkeypatch.setenv('ADMIN_EMAIL','owner@example.com')
+    monkeypatch.setenv('ADMIN_PASSWORD','Owner-password-1234')
     with TestClient(main.app) as c:
         yield c
 
 def signup(c,name='shop_a'):
-    response=c.post('/api/auth/signup',json={'username':name,'password':'Test-password-1234','store_name':name})
+    owner=c.post('/api/auth/login',json={'email':'owner@example.com','password':'Owner-password-1234'})
+    assert owner.status_code==200,owner.text
+    admin=owner.json()['user']
+    ah={'Authorization':'Bearer '+create_access_token(admin['id'],admin['role'],admin['store_id'])}
+    store=c.post('/api/stores/',headers=ah,json={'name':name}).json()
+    email=f'{name}@example.com'
+    response=c.post('/api/auth/register',headers=ah,json={'email':email,'password':'Test-password-1234','full_name':name,'role':'store_admin','store_id':store['id']})
     assert response.status_code==201,response.text
-    u=response.json()['user']
+    u=response.json()
+    login=c.post('/api/auth/login',json={'email':email,'password':'Test-password-1234'})
+    assert login.status_code==200,login.text
     return u,{'Authorization':'Bearer '+create_access_token(u['id'],u['role'],u['store_id'])}
 
 def catalog(c,headers,rows=None):
@@ -83,6 +93,27 @@ def test_complete_flow_and_excel(client,monkeypatch):
     assert sheet['E2'].value==2 and sheet['G2'].value==200
     assert sheet['D2'].data_type=='s'
     assert client.get('/api/stats/dashboard',headers=h).json()['confirmed']==1
+    usage=client.get('/api/stats/ai-usage',headers=h).json()
+    assert usage['stats']['total_requests']==1 and usage['stats']['total_pages']==1
+    assert usage['recent'][0]['pages']==1
+
+def test_super_admin_ai_usage_across_stores(client,monkeypatch):
+    monkeypatch.setenv('MISTRAL_COST_PER_1000_PAGES_USD','2.5')
+    _,ha=signup(client);process(client,ha,upload(client,ha),monkeypatch)
+    _,hb=signup(client,'shop_b');process(client,hb,upload(client,hb,'red'),monkeypatch)
+    assert client.get('/api/stats/admin-ai-usage',headers=ha).status_code==403
+    owner=client.post('/api/auth/login',json={'email':'owner@example.com','password':'Owner-password-1234'}).json()['user']
+    headers={'Authorization':'Bearer '+create_access_token(owner['id'],owner['role'],owner['store_id'])}
+    response=client.get('/api/stats/admin-ai-usage',headers=headers)
+    assert response.status_code==200,response.text
+    data=response.json()
+    assert data['summary']['total_requests']==2
+    assert data['summary']['successful_requests']==2
+    assert data['summary']['failed_requests']==0
+    assert data['summary']['total_pages']==2
+    assert data['summary']['total_cost']==pytest.approx(0.005)
+    assert {row['store_name'] for row in data['stores']}=={'shop_a','shop_b'}
+    assert len(data['recent'])==2
 
 def test_tenant_isolation_and_role_escalation(client,monkeypatch):
     a,ha=signup(client);pa=catalog(client,ha);doc=upload(client,ha)
@@ -98,8 +129,8 @@ def test_tenant_isolation_and_role_escalation(client,monkeypatch):
     assert bad.status_code==404
     for payload in ({'role':'super_admin'},{'store_id':b['store_id']}):
         assert client.put(f'/api/users/{a["id"]}',headers=ha,json=payload).status_code==403
-    assert client.post('/api/auth/register',headers=ha,json={'username':'hacker','password':'Test-password-1234','role':'super_admin'}).status_code==403
-    assert client.post(f'/api/users/{b["id"]}/bind-telegram?chat_id=123',headers=ha).status_code==404
+    assert client.post('/api/auth/register',headers=ha,json={'email':'hacker@example.com','password':'Test-password-1234','role':'store_admin','store_id':a['store_id']}).status_code==403
+    assert client.post(f'/api/users/{b["id"]}/bind-telegram?chat_id=123',headers=ha).status_code==403
     assert 'test-only' not in client.get('/api/settings/',headers=ha).text
     assert client.put('/api/settings/',headers=ha,json={'key':'mistral_api_key','value':'x'}).status_code==405
 
@@ -137,11 +168,12 @@ def test_authentication_and_csrf(client):
     assert client.get('/api/documents/',headers={'Authorization':'Bearer invalid'}).status_code==401
     assert client.post('/api/auth/logout').status_code==200
     assert client.get('/api/auth/me').status_code==401
-    response=client.post('/api/auth/login',json={'username':'shop_a','password':'Test-password-1234'})
+    response=client.post('/api/auth/login',json={'email':'shop_a@example.com','password':'Test-password-1234'})
     assert response.status_code==200
     assert 'HttpOnly' in response.headers['set-cookie'] and 'SameSite=strict' in response.headers['set-cookie']
     assert 'token' not in response.json()
-    assert client.post('/api/auth/login',json={'username':'shop_a','password':'wrong'}).status_code==401
+    assert client.post('/api/auth/login',json={'email':'shop_a@example.com','password':'wrong'}).status_code==401
+    assert client.post('/api/auth/signup',json={'email':'new@example.com','password':'Test-password-1234'}).status_code==404
 
 def test_ambiguous_match_does_not_autoselect(client):
     u,h=signup(client)
@@ -152,11 +184,31 @@ def test_ambiguous_match_does_not_autoselect(client):
 
 def test_operator_cannot_import_or_create_accounts(client):
     u,h=signup(client)
-    response=client.post('/api/auth/register',headers=h,json={'username':'operator','password':'Test-password-1234','role':'operator'})
+    owner=client.post('/api/auth/login',json={'email':'owner@example.com','password':'Owner-password-1234'}).json()['user']
+    ah={'Authorization':'Bearer '+create_access_token(owner['id'],owner['role'],u['store_id'])}
+    response=client.post('/api/auth/register',headers=ah,json={'email':'operator@example.com','password':'Test-password-1234','role':'operator','store_id':u['store_id']})
     assert response.status_code==201,response.text
     op=response.json();oh={'Authorization':'Bearer '+create_access_token(op['id'],op['role'],op['store_id'])}
     assert client.post('/api/products/import',headers=oh,files={'file':('a.csv',b'x')}).status_code==403
-    assert client.post('/api/auth/register',headers=oh,json={'username':'other','password':'Test-password-1234'}).status_code==403
+    payload={'email':'other@example.com','password':'Test-password-1234','role':'operator','store_id':u['store_id']}
+    assert client.post('/api/auth/register',headers=h,json=payload).status_code==403
+    assert client.post('/api/auth/register',headers=oh,json=payload).status_code==403
+
+def test_password_reset_by_email(client,monkeypatch):
+    signup(client)
+    sent={}
+    monkeypatch.setattr('core.mailer.is_configured',lambda:True)
+    def capture(email,url):
+        sent.update(email=email,url=url)
+    monkeypatch.setattr('core.mailer.send_password_reset_email',capture)
+    response=client.post('/api/auth/forgot-password',json={'email':'shop_a@example.com'})
+    assert response.status_code==200,response.text
+    assert sent['email']=='shop_a@example.com'
+    token=sent['url'].split('reset_token=',1)[1]
+    response=client.post('/api/auth/reset-password',json={'token':token,'password':'New-password-1234'})
+    assert response.status_code==200,response.text
+    assert client.post('/api/auth/login',json={'email':'shop_a@example.com','password':'New-password-1234'}).status_code==200
+    assert client.post('/api/auth/reset-password',json={'token':token,'password':'Another-password-1234'}).status_code==400
 
 def test_ocr_failure_sanitized_and_retry_idempotent(client,monkeypatch):
     import core.worker as worker

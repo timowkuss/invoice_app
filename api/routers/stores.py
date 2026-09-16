@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+import uuid
 
 from core.models.user import User
 from core.repositories import StoreRepo
@@ -12,7 +13,7 @@ router = APIRouter()
 
 class StoreCreate(BaseModel):
     name: str
-    code: str
+    code: str = ""
     address: str = ""
     phone: str = ""
     inn: str = ""
@@ -31,7 +32,7 @@ async def list_stores(user: User = Depends(get_current_user)):
 @router.post("/")
 async def create_store(req: StoreCreate, user: User = Depends(require_super_admin)):
     from core.models.store import Store
-    store = Store(name=req.name, code=req.code, address=req.address, phone=req.phone, inn=req.inn)
+    store = Store(name=req.name.strip(), code=req.code.strip() or uuid.uuid4().hex[:16], address=req.address, phone=req.phone, inn=req.inn)
     return (await StoreRepo.create(store)).to_dict()
 
 

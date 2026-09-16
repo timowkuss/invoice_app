@@ -8,6 +8,7 @@ from PIL import Image
 from fastapi import HTTPException
 from aiogram.filters.command import CommandObject
 from test_saas import client, signup, catalog, process
+from core.auth import create_access_token
 from core.repositories import DocumentRepo, UserRepo
 from telegram_bot import bot
 
@@ -27,13 +28,20 @@ def replies(msg):
     return '\n'.join(call.args[0] for call in msg.answer.call_args_list)
 
 
+def owner_headers(client):
+    response=client.post('/api/auth/login',json={'email':'owner@example.com','password':'Owner-password-1234'})
+    assert response.status_code==200,response.text
+    owner=response.json()['user']
+    return {'Authorization':'Bearer '+create_access_token(owner['id'],owner['role'],owner['store_id'])}
+
+
 @pytest.fixture
 def telegram(client,monkeypatch,tmp_path):
     import core.document_service as service
     monkeypatch.setattr(service,'UPLOAD_DIR',tmp_path/'uploads')
     monkeypatch.setenv('WEB_URL','https://invoice.example.test')
     user,headers=signup(client)
-    assert client.post(f'/api/users/{user["id"]}/bind-telegram?chat_id=1001',headers=headers).status_code==200
+    assert client.post(f'/api/users/{user["id"]}/bind-telegram?chat_id=1001',headers=owner_headers(client)).status_code==200
     return user,headers
 
 
@@ -67,10 +75,7 @@ def test_telegram_rejects_unbound_groups_and_disabled_accounts(client,telegram):
     for msg in (message(9999),message(1001,'group')):
         client.portal.call(bot.process_document,msg,'file','invoice.png',100)
         msg.bot.get_file.assert_not_awaited()
-    assert client.put(f'/api/users/{user["id"]}',headers=h,json={'is_active':False}).status_code==409
-    async def disable():
-        u=await UserRepo.get_by_id(user['id']);u.is_active=False;await UserRepo.update(u)
-    client.portal.call(disable)
+    assert client.put(f'/api/users/{user["id"]}',headers=owner_headers(client),json={'is_active':False}).status_code==200
     msg=message()
     client.portal.call(bot.process_document,msg,'file','invoice.png',100)
     msg.bot.get_file.assert_not_awaited()
@@ -81,17 +86,18 @@ def test_telegram_store_isolation_and_unbind(client,telegram):
     msg=message();client.portal.call(bot.process_document,msg,'file','invoice.png',100)
     doc=client.get('/api/documents/',headers=ha).json()['items'][0]
     b,hb=signup(client,'shop_b')
-    assert client.post(f'/api/users/{b["id"]}/bind-telegram?chat_id=1001',headers=hb).status_code==409
-    assert client.post(f'/api/users/{b["id"]}/bind-telegram?chat_id=-1',headers=hb).status_code==422
-    assert client.post(f'/api/users/{b["id"]}/bind-telegram?chat_id=2002',headers=hb).status_code==200
+    owner=owner_headers(client)
+    assert client.post(f'/api/users/{b["id"]}/bind-telegram?chat_id=1001',headers=owner).status_code==409
+    assert client.post(f'/api/users/{b["id"]}/bind-telegram?chat_id=-1',headers=owner).status_code==422
+    assert client.post(f'/api/users/{b["id"]}/bind-telegram?chat_id=2002',headers=owner).status_code==200
     other=message(2002)
     client.portal.call(bot.cmd_history,other)
     assert f'#{doc["id"]}' not in replies(other)
     for command in ('status','retry'):
         client.portal.call(bot.cmd_status,other,CommandObject(command=command,args=str(doc['id'])))
     assert 'Накладная не найдена' in replies(other)
-    assert client.delete(f'/api/users/{b["id"]}/bind-telegram',headers=ha).status_code==404
-    assert client.delete(f'/api/users/{b["id"]}/bind-telegram',headers=hb).status_code==200
+    assert client.delete(f'/api/users/{b["id"]}/bind-telegram',headers=ha).status_code==403
+    assert client.delete(f'/api/users/{b["id"]}/bind-telegram',headers=owner).status_code==200
     rejected=message(2002);client.portal.call(bot.process_document,rejected,'file','invoice.png',100)
     rejected.bot.get_file.assert_not_awaited()
 
@@ -126,6 +132,26 @@ def test_download_buffer_enforces_actual_size(monkeypatch):
     with bot.LimitedBuffer() as buffer:
         buffer.write(b'123')
         with pytest.raises(HTTPException):buffer.write(b'4')
+
+
+@pytest.mark.parametrize('url', [
+    'http://127.0.0.1:8000',
+    'http://localhost:8000',
+    'http://192.168.1.10:8000',
+])
+def test_telegram_hides_keyboard_for_local_web_urls(monkeypatch, url):
+    monkeypatch.setenv('WEB_URL', url)
+    assert bot.document_keyboard(12) is None
+
+
+def test_telegram_retries_status_without_rejected_keyboard(client, monkeypatch):
+    monkeypatch.setenv('WEB_URL', 'https://invoice.example.test')
+    msg = message()
+    msg.answer.side_effect = [bot.TelegramBadRequest(method=SimpleNamespace(), message='Bad Request: BUTTON_URL_INVALID'), None]
+    doc = SimpleNamespace(id=12, status='needs_review', total_items=8, needs_review_items=0)
+    client.portal.call(bot.send_status, msg, doc)
+    assert msg.answer.await_count == 2
+    assert msg.answer.await_args_list[1].kwargs == {}
 
 
 def test_telegram_rechecks_access_after_download(client,telegram):

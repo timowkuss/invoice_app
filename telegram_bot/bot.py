@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 from io import BytesIO
@@ -9,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.filters.command import CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -41,6 +43,14 @@ def document_keyboard(doc_id):
     parsed = urlsplit(url)
     if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
         return None
+    hostname = parsed.hostname.lower()
+    if hostname == 'localhost' or hostname.endswith('.localhost'):
+        return None
+    try:
+        if not ipaddress.ip_address(hostname).is_global:
+            return None
+    except ValueError:
+        pass
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='Проверить на сайте', url=f'{url}/?document={doc_id}')
     ]])
@@ -73,7 +83,14 @@ async def send_status(message, doc):
         text += f'\nПовторить распознавание: /retry {doc.id}'
     if doc.status in ('received', 'retry_pending', 'processing'):
         text += f'\nПроверить статус: /status {doc.id}'
-    await message.answer(text, reply_markup=document_keyboard(doc.id))
+    keyboard = document_keyboard(doc.id)
+    try:
+        await message.answer(text, reply_markup=keyboard)
+    except TelegramBadRequest:
+        if keyboard is None:
+            raise
+        logger.warning('Telegram rejected the WEB_URL button; sending status without it')
+        await message.answer(text)
 
 
 @dp.message(Command('start', 'help'))
@@ -189,8 +206,6 @@ async def main():
     token = os.getenv('TELEGRAM_TOKEN', '')
     if not token or token.startswith('your_'):
         raise RuntimeError('Set TELEGRAM_TOKEN in .env')
-    if not document_keyboard(1):
-        raise RuntimeError('Set WEB_URL to the public web application URL')
     bot = Bot(token=token)
     try:
         await init_db(DATABASE_URL)

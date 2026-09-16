@@ -87,8 +87,10 @@ class UserRepo:
     @staticmethod
     async def get_by_username(username: str) -> User | None:
         async with get_connection() as conn:
-            row = await conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
+            row = await conn.fetchrow("SELECT * FROM users WHERE lower(username) = lower($1)", username)
             return User.from_row(dict(row)) if row else None
+
+    get_by_email = get_by_username
 
     @staticmethod
     async def get_by_telegram(chat_id: int) -> User | None:
@@ -132,6 +134,14 @@ class UserRepo:
             await conn.execute(
                 "UPDATE users SET telegram_chat_id = $1, updated_at = NOW() WHERE id = $2",
                 chat_id, user_id,
+            )
+
+    @staticmethod
+    async def set_password(user_id: int, password_hash: str) -> None:
+        async with get_connection() as conn:
+            await conn.execute(
+                "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+                password_hash, user_id,
             )
 
 
@@ -542,12 +552,12 @@ class AiRequestRepo:
         async with get_connection() as conn:
             row = await conn.fetchrow(
                 """INSERT INTO ai_requests (store_id, user_id, document_id, provider,
-                   model, request_type, status, input_tokens, output_tokens,
+                   model, request_type, status, pages, input_tokens, output_tokens,
                    total_tokens, cost, error_message, duration_ms)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                    RETURNING *""",
                 req.store_id, req.user_id, req.document_id, req.provider,
-                req.model, req.request_type, req.status, req.input_tokens,
+                req.model, req.request_type, req.status, req.pages, req.input_tokens,
                 req.output_tokens, req.total_tokens, req.cost,
                 req.error_message, req.duration_ms,
             )
@@ -572,6 +582,7 @@ class AiRequestRepo:
             where = " AND ".join(conditions)
             row = await conn.fetchrow(
                 f"""SELECT COUNT(*) as total_requests,
+                    COALESCE(SUM(pages), 0) as total_pages,
                     SUM(total_tokens) as total_tokens,
                     SUM(cost) as total_cost,
                     SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as errors

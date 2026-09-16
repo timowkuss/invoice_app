@@ -1,6 +1,7 @@
 """Persistent document queue. Claims are atomic across server processes."""
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -13,6 +14,15 @@ from core.ocr_service import recognize, OcrError
 from core.uploads import document_path
 
 logger=logging.getLogger(__name__)
+
+def estimated_cost(pages):
+    try:
+        rate=Decimal(os.getenv('MISTRAL_COST_PER_1000_PAGES_USD','4'))
+        if not rate.is_finite() or rate < 0:
+            return 0.0
+        return float((Decimal(pages) * rate / Decimal(1000)).quantize(Decimal('0.000001')))
+    except InvalidOperation:
+        return 0.0
 
 def number(value):
     if value is None or not str(value).strip():
@@ -44,7 +54,7 @@ async def process_claimed(doc):
             await DocumentRepo.update_counts(doc.id,len(items),good,len(items)-good)
             await DocumentRepo.update_status(doc.id,'needs_review')
             await AiRequestRepo.create(AiRequest(store_id=doc.store_id,user_id=doc.sent_by_user_id,document_id=doc.id,
-                duration_ms=int((time.monotonic()-started)*1000),status='success'))
+                pages=pages,cost=estimated_cost(pages),duration_ms=int((time.monotonic()-started)*1000),status='success'))
     except asyncio.CancelledError:
         await DocumentRepo.update_status(doc.id,'error','Обработка прервана обновлением сервера. Повторите вручную.')
         raise
