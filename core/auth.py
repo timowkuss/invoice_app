@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from datetime import datetime, timedelta
 
@@ -14,6 +15,14 @@ from core.config import secret_key
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
+EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def normalize_email(email: str) -> str:
+    value = email.strip().lower()
+    if len(value) > 254 or not EMAIL_PATTERN.fullmatch(value):
+        raise ValueError("Укажите корректный email")
+    return value
 
 
 def hash_password(password: str) -> str:
@@ -54,19 +63,20 @@ def decode_access_token(token: str) -> dict | None:
 class AuthService:
     @staticmethod
     async def register(
-        username: str,
+        email: str,
         password: str,
         full_name: str = "",
         role: str = "operator",
         store_id: int | None = None,
         telegram_chat_id: int | None = None,
     ) -> User:
-        existing = await UserRepo.get_by_username(username)
+        email = normalize_email(email)
+        existing = await UserRepo.get_by_email(email)
         if existing:
-            raise ValueError("Username already exists")
+            raise ValueError("Аккаунт с таким email уже существует")
 
         user = User(
-            username=username,
+            username=email,
             password_hash=hash_password(password),
             full_name=full_name,
             role=role,
@@ -76,8 +86,9 @@ class AuthService:
         return await UserRepo.create(user)
 
     @staticmethod
-    async def login(username: str, password: str) -> tuple[User, str]:
-        user = await UserRepo.get_by_username(username)
+    async def login(email: str, password: str) -> tuple[User, str]:
+        email = normalize_email(email)
+        user = await UserRepo.get_by_email(email)
         if not user or not user.is_active:
             raise ValueError("Invalid username or password")
 
@@ -98,8 +109,8 @@ class AuthService:
         return await UserRepo.get_by_id(user_id)
 
     @staticmethod
-    async def bind_telegram(username: str, chat_id: int) -> User:
-        user = await UserRepo.get_by_username(username)
+    async def bind_telegram(email: str, chat_id: int) -> User:
+        user = await UserRepo.get_by_email(normalize_email(email))
         if not user:
             raise ValueError("User not found")
         await UserRepo.set_telegram(user.id, chat_id)
@@ -108,14 +119,15 @@ class AuthService:
 
     @staticmethod
     async def init_super_admin() -> None:
-        username = os.getenv('ADMIN_USERNAME', '')
+        email = os.getenv('ADMIN_EMAIL', '') or os.getenv('ADMIN_USERNAME', '')
         password = os.getenv('ADMIN_PASSWORD', '')
-        if not username or not password:
+        if not email or not password:
             return
-        existing = await UserRepo.get_by_username(username)
+        email = normalize_email(email)
+        existing = await UserRepo.get_by_email(email)
         if not existing:
             await AuthService.register(
-                username=username,
+                email=email,
                 password=password,
                 full_name="Super Admin",
                 role="super_admin",

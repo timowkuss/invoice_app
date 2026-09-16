@@ -22,6 +22,7 @@ class User:
             "id": self.id,
             "store_id": self.store_id,
             "username": self.username,
+            "email": self.username,
             "full_name": self.full_name,
             "role": self.role,
             "telegram_chat_id": self.telegram_chat_id,

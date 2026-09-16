@@ -7,3 +7,6 @@
 /* Keep row actions accessible while the invoice table scrolls horizontally. */
 .review-table td:last-child,.review-table th:last-child{position:sticky;right:0;background:white}
 .review-table td:last-child .btn{display:flex;width:100%;margin:4px 0}
+.usage-metrics{grid-template-columns:repeat(5,minmax(150px,1fr))}
+@media(max-width:1200px){.usage-metrics{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:720px){.usage-metrics{grid-template-columns:1fr 1fr}}

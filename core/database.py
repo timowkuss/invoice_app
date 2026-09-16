@@ -68,6 +68,9 @@ async def init_db(dsn, min_size=2, max_size=10):
         _sqlite.create_function('lower', 1, lambda s: s.casefold() if s else s)
         _lock = asyncio.Lock()
         _sqlite.executescript((ROOT / 'migrations/sqlite.sql').read_text(encoding='utf-8-sig'))
+        ai_columns = {row[1] for row in _sqlite.execute('PRAGMA table_info(ai_requests)').fetchall()}
+        if 'pages' not in ai_columns:
+            _sqlite.execute('ALTER TABLE ai_requests ADD COLUMN pages INTEGER DEFAULT 0')
     else:
         _pool = await asyncpg.create_pool(dsn, min_size=min_size, max_size=max_size)
         async with _pool.acquire() as conn:

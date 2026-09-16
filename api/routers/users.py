@@ -9,7 +9,7 @@ from typing import Literal
 
 from core.models.user import User
 from core.repositories import UserRepo
-from api.routers.auth import get_current_user, require_admin
+from api.routers.auth import require_super_admin
 
 router = APIRouter()
 
@@ -22,16 +22,13 @@ class UserUpdate(BaseModel):
 
 
 @router.get("/")
-async def list_users(user: User = Depends(require_admin)):
-    if user.is_super_admin:
-        users = await UserRepo.list_all()
-    else:
-        users = await UserRepo.list_by_store(user.store_id)
+async def list_users(user: User = Depends(require_super_admin)):
+    users = await UserRepo.list_by_store(user.store_id) if user.store_id else await UserRepo.list_all()
     return [u.to_dict() for u in users]
 
 
 @router.get("/{user_id}")
-async def get_user(user_id: int, user: User = Depends(require_admin)):
+async def get_user(user_id: int, user: User = Depends(require_super_admin)):
     target = await UserRepo.get_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -41,7 +38,7 @@ async def get_user(user_id: int, user: User = Depends(require_admin)):
 
 
 @router.put("/{user_id}")
-async def update_user(user_id: int, req: UserUpdate, user: User = Depends(require_admin)):
+async def update_user(user_id: int, req: UserUpdate, user: User = Depends(require_super_admin)):
     target = await UserRepo.get_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -69,7 +66,7 @@ async def update_user(user_id: int, req: UserUpdate, user: User = Depends(requir
 
 
 @router.post("/{user_id}/bind-telegram")
-async def bind_telegram(user_id: int, chat_id: int = Query(gt=0,lt=2**52), user: User = Depends(require_admin)):
+async def bind_telegram(user_id: int, chat_id: int = Query(gt=0,lt=2**52), user: User = Depends(require_super_admin)):
     try:
         async with get_transaction() as conn:
             await conn.execute('UPDATE users SET updated_at=updated_at WHERE id=$1',user_id)
@@ -88,7 +85,7 @@ async def bind_telegram(user_id: int, chat_id: int = Query(gt=0,lt=2**52), user:
 
 
 @router.delete("/{user_id}/bind-telegram")
-async def unbind_telegram(user_id: int, user: User = Depends(require_admin)):
+async def unbind_telegram(user_id: int, user: User = Depends(require_super_admin)):
     async with get_transaction() as conn:
         await conn.execute('UPDATE users SET updated_at=updated_at WHERE id=$1',user_id)
         target = await UserRepo.get_by_id(user_id)

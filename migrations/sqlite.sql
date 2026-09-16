@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS ai_requests (
     model VARCHAR(100) NOT NULL DEFAULT 'mistral-ocr-latest',
     request_type VARCHAR(50) NOT NULL CHECK (request_type IN ('ocr', 'matching', 'other')),
     status VARCHAR(20) NOT NULL CHECK (status IN ('success', 'error', 'timeout')),
+    pages INTEGER DEFAULT 0,
     input_tokens INTEGER DEFAULT 0,
     output_tokens INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
@@ -234,3 +235,14 @@ INSERT INTO app_settings (key, value, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS login_attempts (key TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, window_start REAL NOT NULL);
+
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash VARCHAR(64) UNIQUE NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    used_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_password_reset_user ON password_reset_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_password_reset_expiry ON password_reset_tokens(expires_at);
