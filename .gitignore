@@ -22,3 +22,8 @@ uploads/
 .mypy_cache/
 .pytest_cache/
 mistral api.txt
+
+data/
+.local/
+.env.*
+!.env.example

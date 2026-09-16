@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from core.models.user import User
 from core.repositories import ProductAliasRepo, ProductRepo
 from core.matching.service import MatchingService, normalize_text
-from api.routers.auth import get_current_user
+from api.routers.auth import require_store as get_current_user
 
 router = APIRouter()
 
@@ -43,7 +43,9 @@ async def list_aliases(user: User = Depends(get_current_user)):
 
 @router.delete("/aliases/{alias_id}")
 async def delete_alias(alias_id: int, user: User = Depends(get_current_user)):
-    deleted = await ProductAliasRepo.delete(alias_id)
+    if not user.is_store_admin:
+        raise HTTPException(403, 'Нужны права администратора магазина')
+    deleted = await ProductAliasRepo.delete(alias_id, user.store_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Alias not found")
     return {"status": "deleted"}

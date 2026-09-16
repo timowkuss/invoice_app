@@ -23,10 +23,8 @@ async def list_stores(user: User = Depends(get_current_user)):
     if user.is_super_admin:
         stores = await StoreRepo.list_all()
     else:
-        from core.database import get_connection
-        async with get_connection() as conn:
-            row = await conn.fetchrow("SELECT * FROM stores WHERE id = $1", user.store_id)
-            stores = [row] if row else []
+        store = await StoreRepo.get_by_id(user.store_id)
+        stores = [store] if store else []
     return [s if isinstance(s, dict) else s.to_dict() for s in stores]
 
 

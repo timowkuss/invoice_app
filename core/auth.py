@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+import os
 import secrets
 from datetime import datetime, timedelta
 
@@ -9,19 +9,24 @@ import jwt
 
 from core.models.user import User
 from core.repositories import UserRepo
+from core.config import secret_key
 
 
-SECRET_KEY = ""  # Set from .env
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
 
 def hash_password(password: str) -> str:
+    if len(password) < 10 or len(password.encode()) > 72:
+        raise ValueError('Пароль должен содержать от 10 символов до 72 байт')
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return bcrypt.checkpw(password.encode(), password_hash.encode())
+    try:
+        return bcrypt.checkpw(password.encode(), password_hash.encode())
+    except ValueError:
+        return False
 
 
 def create_access_token(user_id: int, role: str, store_id: int | None = None) -> str:
@@ -33,12 +38,14 @@ def create_access_token(user_id: int, role: str, store_id: int | None = None) ->
         "exp": expire,
         "iat": datetime.utcnow(),
     }
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(payload, secret_key(), algorithm=ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict | None:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, secret_key(), algorithms=[ALGORITHM], options={'require': ['sub', 'exp', 'iat']})
+        if not str(payload['sub']).isdigit():
+            return None
         return payload
     except jwt.InvalidTokenError:
         return None
@@ -101,11 +108,15 @@ class AuthService:
 
     @staticmethod
     async def init_super_admin() -> None:
-        existing = await UserRepo.get_by_username("admin")
+        username = os.getenv('ADMIN_USERNAME', '')
+        password = os.getenv('ADMIN_PASSWORD', '')
+        if not username or not password:
+            return
+        existing = await UserRepo.get_by_username(username)
         if not existing:
             await AuthService.register(
-                username="admin",
-                password="admin",
+                username=username,
+                password=password,
                 full_name="Super Admin",
                 role="super_admin",
             )
