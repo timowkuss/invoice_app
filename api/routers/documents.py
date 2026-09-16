@@ -16,6 +16,7 @@ from core.config import UPLOAD_DIR
 from core.database import get_connection, get_transaction
 from core.repositories import DocumentRepo, DocumentItemRepo, ProductRepo, ProductAliasRepo, AuditLogRepo
 from core.models.document import Document
+from core.models.document_item import DocumentItem
 from core.models.audit_log import AuditLog
 from core.models.product_alias import ProductAlias
 from core.matching.service import normalize_text, MatchingService
@@ -122,6 +123,60 @@ class ItemUpdate(BaseModel):
     price:Decimal|None=Field(default=None,ge=0,le=999999999,max_digits=12,decimal_places=2,allow_inf_nan=False)
     create_alias:bool=False
 
+class ItemCreate(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    product_id:int=Field(gt=0)
+    quantity:Decimal=Field(gt=0,le=9999999,max_digits=10,decimal_places=3,allow_inf_nan=False)
+    price:Decimal=Field(ge=0,le=999999999,max_digits=12,decimal_places=2,allow_inf_nan=False)
+
+def require_editable(doc):
+    if doc.status not in ('needs_review','recognized','confirmed'):
+        raise HTTPException(409,'Редактирование доступно после распознавания')
+
+async def refresh_items(doc_id,conn):
+    items=await DocumentItemRepo.list_by_document(doc_id)
+    good=sum(i.match_status in ('matched','manual') for i in items)
+    await DocumentRepo.update_counts(doc_id,len(items),good,len(items)-good)
+    await DocumentRepo.update_status(doc_id,'needs_review')
+    await conn.execute('UPDATE documents SET confirmed_at=NULL WHERE id=$1',doc_id)
+
+@router.post('/{doc_id}/items',status_code=201)
+async def add_item(doc_id:int,req:ItemCreate,user=Depends(require_store)):
+    async with get_transaction() as conn:
+        doc=await lock_document(doc_id,user,conn)
+        require_editable(doc)
+        product=await ProductRepo.get_by_id(req.product_id)
+        if not product or product.store_id!=user.store_id or not product.is_active:
+            raise HTTPException(404,'Товар не найден в каталоге магазина')
+        items=await DocumentItemRepo.list_by_document(doc_id)
+        if len(items)>=2000:
+            raise HTTPException(409,'В накладной не может быть больше 2000 строк')
+        item=await DocumentItemRepo.create(DocumentItem(
+            document_id=doc_id,row_number=max((i.row_number for i in items),default=0)+1,
+            product_id=product.id,product_name=product.name,article=product.article or '',
+            barcode=product.barcode or '',unit=product.unit or '',quantity=req.quantity,price=req.price,
+            total=(req.quantity*req.price).quantize(Decimal('.01'),rounding=ROUND_HALF_UP),
+            match_status='manual',confidence=Decimal('100')))
+        await refresh_items(doc_id,conn)
+        await audit(user,doc_id,'add_item',new=item.to_dict())
+    return item.to_dict()
+
+@router.delete('/{doc_id}/items/{item_id}')
+async def delete_item(doc_id:int,item_id:int,user=Depends(require_store)):
+    async with get_transaction() as conn:
+        doc=await lock_document(doc_id,user,conn)
+        require_editable(doc)
+        item=await DocumentItemRepo.get_by_id(item_id)
+        if not item or item.document_id!=doc_id:
+            raise HTTPException(404,'Строка не найдена')
+        await conn.execute('DELETE FROM document_items WHERE id=$1 AND document_id=$2',item_id,doc_id)
+        items=await DocumentItemRepo.list_by_document(doc_id)
+        for number,row in enumerate(items,1):
+            await conn.execute('UPDATE document_items SET row_number=$1 WHERE id=$2',number,row.id)
+        await refresh_items(doc_id,conn)
+        await audit(user,doc_id,'delete_item',old=item.to_dict())
+    return {'status':'deleted'}
+
 @router.put('/{doc_id}/items/{item_id}')
 async def update_item(doc_id:int,item_id:int,req:ItemUpdate,user=Depends(require_store)):
     async with get_transaction() as conn:
@@ -156,10 +211,7 @@ async def update_item(doc_id:int,item_id:int,req:ItemUpdate,user=Depends(require
             await conn.execute('UPDATE stores SET updated_at=updated_at WHERE id=$1',user.store_id)
             await conn.execute('DELETE FROM product_aliases WHERE store_id=$1 AND normalized_text=$2',user.store_id,normalized)
             await ProductAliasRepo.create(ProductAlias(store_id=user.store_id,product_id=req.product_id,ocr_text=item.ocr_text,normalized_text=normalized,confidence=Decimal('100'),created_by=user.id))
-        items=await DocumentItemRepo.list_by_document(doc_id)
-        good=sum(i.match_status in ('matched','manual') for i in items)
-        await DocumentRepo.update_counts(doc_id,len(items),good,len(items)-good)
-        await DocumentRepo.update_status(doc_id,'needs_review')
+        await refresh_items(doc_id,conn)
         await audit(user,doc_id,'update_item',old,item.to_dict())
     return item.to_dict()
 

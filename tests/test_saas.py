@@ -172,3 +172,60 @@ def test_ocr_failure_sanitized_and_retry_idempotent(client,monkeypatch):
     result=client.get(url,headers=h)
     assert result.json()['document']['status']=='error'
     assert 'SECRET MUST NOT LEAK' not in result.text
+
+def test_add_delete_items_and_export(client,monkeypatch):
+    _,h=signup(client);products=catalog(client,h);doc=upload(client,h)
+    result=process(client,h,doc,monkeypatch)
+    url=f'/api/documents/{doc["id"]}'
+    assert client.post(url+'/confirm',headers=h).status_code==200
+    created=client.post(url+'/items',headers=h,json={'product_id':products[1]['id'],'quantity':'1.125','price':'2.12'})
+    assert created.status_code==201,created.text
+    item=created.json()
+    assert item['row_number']==2 and item['total']==2.39 and item['match_status']=='manual'
+    assert item['ocr_text']=='' and item['product_name']==products[1]['name']
+    detail=client.get(url,headers=h).json()['document']
+    assert detail['status']=='needs_review' and detail['confirmed_at'] is None
+    assert detail['total_items']==2 and detail['matched_items']==2
+    assert client.get(url+'/export',headers=h).status_code==409
+    assert client.post(url+'/confirm',headers=h).status_code==200
+    old_id=result['items'][0]['id']
+    assert client.delete(url+f'/items/{old_id}',headers=h).status_code==200
+    detail=client.get(url,headers=h).json()
+    assert detail['items'][0]['id']==item['id'] and detail['items'][0]['row_number']==1
+    assert detail['document']['total_items']==1 and detail['document']['confirmed_at'] is None
+    assert client.get(url+'/export',headers=h).status_code==409
+    assert client.post(url+'/confirm',headers=h).status_code==200
+    book=load_workbook(io.BytesIO(client.get(url+'/export',headers=h).content))
+    assert book.active.max_row==2 and book.active['B2'].value==products[1]['name']
+    assert book.active['G2'].value==2.39
+    assert client.delete(url+f'/items/{item["id"]}',headers=h).status_code==200
+    detail=client.get(url,headers=h).json()
+    assert detail['items']==[] and detail['document']['total_items']==0
+    assert client.post(url+'/confirm',headers=h).status_code==409
+    assert client.delete(url+f'/items/{item["id"]}',headers=h).status_code==404
+    again=client.post(url+'/items',headers=h,json={'product_id':products[0]['id'],'quantity':1,'price':0})
+    assert again.status_code==201 and again.json()['row_number']==1 and again.json()['total']==0
+    actions=[x['action'] for x in client.get(url+'/audit',headers=h).json()]
+    assert actions.count('add_item')==2 and actions.count('delete_item')==2
+
+
+def test_row_changes_validate_ownership_and_status(client,monkeypatch):
+    from core.repositories import DocumentRepo
+    _,ha=signup(client);pa=catalog(client,ha);doc=upload(client,ha)
+    result=process(client,ha,doc,monkeypatch)
+    item=result['items'][0]
+    url=f'/api/documents/{doc["id"]}'
+    _,hb=signup(client,'shop_b');pb=catalog(client,hb);other=upload(client,hb)
+    process(client,hb,other,monkeypatch)
+    payload={'product_id':pa[0]['id'],'quantity':1,'price':1}
+    assert client.post(url+'/items',headers=hb,json=payload).status_code==404
+    assert client.delete(url+f'/items/{item["id"]}',headers=hb).status_code==404
+    assert client.delete(f'/api/documents/{other["id"]}/items/{item["id"]}',headers=hb).status_code==404
+    assert client.post(url+'/items',headers=ha,json={**payload,'product_id':pb[0]['id']}).status_code==404
+    for invalid in ({'quantity':0},{'quantity':-1},{'quantity':'NaN'},{'price':-1},{'price':'Infinity'},{'quantity':'0.0001'},{'price':'1.001'},{'product_id':None}):
+        assert client.post(url+'/items',headers=ha,json={**payload,**invalid}).status_code==422
+    for status in ('received','processing','retry_pending','sent_to_1c','completed','error'):
+        client.portal.call(DocumentRepo.update_status,doc['id'],status)
+        assert client.post(url+'/items',headers=ha,json=payload).status_code==409
+        assert client.delete(url+f'/items/{item["id"]}',headers=ha).status_code==409
+    assert len(client.get(url,headers=ha).json()['items'])==1
