@@ -1,9 +1,5 @@
 from __future__ import annotations
 import asyncio
-import hashlib
-import os
-import uuid
-from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 from pathlib import Path
@@ -15,54 +11,19 @@ from openpyxl.styles import Font, PatternFill
 from core.config import UPLOAD_DIR
 from core.database import get_connection, get_transaction
 from core.repositories import DocumentRepo, DocumentItemRepo, ProductRepo, ProductAliasRepo, AuditLogRepo
-from core.models.document import Document
 from core.models.document_item import DocumentItem
-from core.models.audit_log import AuditLog
 from core.models.product_alias import ProductAlias
 from core.matching.service import normalize_text, MatchingService
-from core.uploads import read_upload, validate_document, document_path
+from core.uploads import read_upload, document_path
+from core.document_service import owned_document,lock_document,audit,save_document,queue_document
 from api.routers.auth import require_store
 
 router=APIRouter()
 
-async def owned_document(doc_id,user):
-    doc=await DocumentRepo.get_by_id(doc_id)
-    if not doc or doc.store_id!=user.store_id:
-        raise HTTPException(404,'Накладная не найдена')
-    return doc
-
-async def lock_document(doc_id,user,conn):
-    await conn.execute('UPDATE documents SET updated_at=updated_at WHERE id=$1 AND store_id=$2',doc_id,user.store_id)
-    return await owned_document(doc_id,user)
-
-async def audit(user,doc_id,action,old=None,new=None):
-    await AuditLogRepo.create(AuditLog(store_id=user.store_id,user_id=user.id,document_id=doc_id,
-        action=action,entity_type='document',entity_id=doc_id,old_value=old,new_value=new))
-
 @router.post('/upload',status_code=201)
 async def upload_document(file:UploadFile=File(...),supplier:str=Form('',max_length=500),user=Depends(require_store)):
     data=await read_upload(file)
-    suffix=Path(file.filename or '').suffix.lower()
-    await asyncio.to_thread(validate_document,data,suffix)
-    digest=hashlib.sha256(data).hexdigest()
-    directory=UPLOAD_DIR / str(user.store_id)
-    directory.mkdir(parents=True,exist_ok=True)
-    path=directory / f'{uuid.uuid4().hex}{suffix}'
-    try:
-        async with get_transaction() as conn:
-            await conn.execute('UPDATE stores SET updated_at=updated_at WHERE id=$1',user.store_id)
-            existing=await DocumentRepo.get_by_hash(user.store_id,digest)
-            if existing:
-                raise HTTPException(409,{'message':'Эта накладная уже загружена','document_id':existing.id})
-            daily=await conn.fetchval('SELECT COUNT(*) FROM documents WHERE store_id=$1 AND created_at>=$2',user.store_id,datetime.utcnow()-timedelta(days=1))
-            if daily>=int(os.getenv('DAILY_UPLOAD_LIMIT','100')):
-                raise HTTPException(429,'Достигнут дневной лимит загрузок магазина')
-            await asyncio.to_thread(path.write_bytes,data)
-            doc=await DocumentRepo.create(Document(store_id=user.store_id,supplier=supplier,original_file_url=str(path),original_file_hash=digest,sent_by_user_id=user.id,status='received'))
-            await audit(user,doc.id,'upload')
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
+    doc=await save_document(data,file.filename,user,supplier,upload_dir=UPLOAD_DIR)
     return public_document(doc)
 
 def public_document(doc):
@@ -75,20 +36,7 @@ def public_document(doc):
 @router.post('/{doc_id}/process',status_code=202)
 @router.post('/{doc_id}/retry',status_code=202)
 async def process_document(doc_id:int,user=Depends(require_store)):
-    if not os.getenv('MISTRAL_API_KEY'):
-        raise HTTPException(503,'Mistral ещё не настроен')
-    async with get_transaction() as conn:
-        doc=await lock_document(doc_id,user,conn)
-        if doc.status in ('retry_pending','processing'):
-            return {'document_id':doc_id,'status':doc.status}
-        if doc.status not in ('received','error'):
-            raise HTTPException(409,'Документ уже распознан. Отредактируйте результат.')
-        attempts=await conn.fetchval("SELECT COUNT(*) FROM audit_logs WHERE document_id=$1 AND action='queue_ocr'",doc_id)
-        if attempts>=5:
-            raise HTTPException(429,'Лимит повторов OCR исчерпан. Обратитесь в поддержку.')
-        await DocumentRepo.update_status(doc_id,'retry_pending')
-        await audit(user,doc_id,'queue_ocr')
-    return {'document_id':doc_id,'status':'retry_pending'}
+    return await queue_document(doc_id,user)
 
 @router.get('/')
 async def list_documents(status:str|None=None,limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0),user=Depends(require_store)):

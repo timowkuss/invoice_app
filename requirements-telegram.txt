@@ -1,0 +1,2 @@
+-r requirements-web.txt
+aiogram>=3.12,<4
