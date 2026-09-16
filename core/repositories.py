@@ -137,6 +137,27 @@ class UserRepo:
 
 class ProductRepo:
     @staticmethod
+    async def find_identifier(store_id, field, value):
+        if field not in ('barcode', 'article'):
+            raise ValueError('Invalid identifier')
+        async with get_connection() as conn:
+            rows = await conn.fetch(f'SELECT * FROM products WHERE store_id=$1 AND is_active=TRUE AND lower({field})=lower($2)', store_id, value.strip())
+            return [Product.from_row(dict(row)) for row in rows]
+
+    @staticmethod
+    async def match_candidates(store_id, text):
+        import re
+        tokens = list(dict.fromkeys(re.findall(r'[^\W\d_]{3,}', text.casefold())))[:10]
+        if not tokens:
+            return []
+        predicates = [f"lower(replace(name, 'ё', 'е')) LIKE '%' || ${i+2} || '%'" for i in range(len(tokens))]
+        score = ' + '.join(f'CASE WHEN {part} THEN 1 ELSE 0 END' for part in predicates)
+        sql = f"SELECT * FROM products WHERE store_id=$1 AND is_active=TRUE AND ({' OR '.join(predicates)}) ORDER BY ({score}) DESC,id LIMIT 500"
+        async with get_connection() as conn:
+            rows = await conn.fetch(sql, store_id, *[t.replace('ё','е') for t in tokens])
+            return [Product.from_row(dict(row)) for row in rows]
+
+    @staticmethod
     async def create(product: Product) -> Product:
         async with get_connection() as conn:
             row = await conn.fetchrow(
@@ -184,7 +205,7 @@ class ProductRepo:
             rows = await conn.fetch(
                 """SELECT * FROM products
                    WHERE store_id = $1 AND is_active = TRUE
-                   AND (name ILIKE '%' || $2 || '%'
+                   AND (lower(name) LIKE '%' || lower($2) || '%'
                         OR article ILIKE '%' || $2 || '%'
                         OR barcode ILIKE '%' || $2 || '%')
                    ORDER BY name LIMIT $3""",
@@ -299,10 +320,10 @@ class ProductAliasRepo:
             return [ProductAlias.from_row(dict(r)) for r in rows]
 
     @staticmethod
-    async def delete(alias_id: int) -> bool:
+    async def delete(alias_id: int, store_id: int) -> bool:
         async with get_connection() as conn:
             result = await conn.execute(
-                "DELETE FROM product_aliases WHERE id = $1", alias_id,
+                "DELETE FROM product_aliases WHERE id = $1 AND store_id = $2", alias_id, store_id,
             )
             return result == "DELETE 1"
 
@@ -583,8 +604,8 @@ class AuditLogRepo:
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *""",
                 log.store_id, log.user_id, log.document_id, log.action,
                 log.entity_type, log.entity_id,
-                json.dumps(log.old_value) if log.old_value else None,
-                json.dumps(log.new_value) if log.new_value else None,
+                json.dumps(log.old_value, default=str) if log.old_value else None,
+                json.dumps(log.new_value, default=str) if log.new_value else None,
                 log.ip_address,
             )
             return AuditLog.from_row(dict(row))

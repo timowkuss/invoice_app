@@ -1,460 +1,128 @@
-const API = '/api';
-let token = localStorage.getItem('token');
-let currentUser = null;
-
-// ============================================================
-// Auth
-// ============================================================
-async function api(url, options = {}) {
-    const headers = { 'Content-Type': 'application/json', ...options.headers };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-    const res = await fetch(API + url, { ...options, headers });
-    if (res.status === 401) { logout(); return null; }
-    if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || 'Error');
-    }
-    return res.json();
+'use strict';
+const app = document.querySelector('#app');
+const modal = document.querySelector('#modal');
+let user = null, page = 'dashboard', selectedStore = sessionStorage.getItem('store') || '', timer = null, currentDoc = null, previewUrl = null, catalogOffset = 0;
+const labels = {received:'Загружена',retry_pending:'В очереди',processing:'Распознаём',needs_review:'Нужна проверка',recognized:'Распознана',confirmed:'Проверена',error:'Ошибка',matched:'Совпадение',manual:'Подтверждено',not_found:'Выберите товар',pending:'Ожидает'};
+const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money = value => value == null ? '—' : Number(value).toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2});
+const badge = status => `<span class="badge ${esc(status)}">${esc(labels[status] || status)}</span>`;
+const date = value => value ? new Date(value).toLocaleDateString('ru-RU') : '—';
+function toast(message) {const el=document.querySelector('#toast');el.textContent=message;el.classList.add('visible');setTimeout(()=>el.classList.remove('visible'),4500);}
+async function request(path, options={}) {
+  const headers = {...options.headers};
+  if (!(options.body instanceof FormData) && options.body) headers['Content-Type']='application/json';
+  if (selectedStore) headers['X-Store-ID']=selectedStore;
+  const res=await fetch('/api'+path,{...options,headers,credentials:'same-origin'});
+  if (!res.ok) {
+    const data=await res.json().catch(()=>({}));
+    let message=data.detail;
+    if (Array.isArray(message)) message=message.map(e=>`${e.loc.at(-1)}: ${e.msg}`).join('; ');
+    if (typeof message==='object') message=message.message;
+    if (res.status===401 && !path.startsWith('/auth/')) authView();
+    throw new Error(message || 'Не удалось выполнить запрос');
+  }
+  return res;
 }
-
-async function login() {
-    const username = document.getElementById('login-user').value;
-    const password = document.getElementById('login-pass').value;
-    try {
-        const data = await api('/auth/login', {
-            method: 'POST',
-            body: JSON.stringify({ username, password }),
-        });
-        token = data.token;
-        currentUser = data.user;
-        localStorage.setItem('token', token);
-        showApp();
-    } catch (e) {
-        document.getElementById('login-error').textContent = e.message;
-    }
+async function api(path,options) {return (await request(path,options)).json();}
+async function download(path,filename) {
+  const blob=await (await request(path)).blob();const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;a.download=filename;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
-
-function logout() {
-    token = null;
-    currentUser = null;
-    localStorage.removeItem('token');
-    showLogin();
+function openModal(title,content) {document.querySelector('#modal-content').innerHTML=`<div class="modal-head"><h2>${esc(title)}</h2><button class="modal-close" data-action="close" aria-label="Закрыть">×</button></div>${content}`;modal.showModal();}
+function closeModal(){modal.close();}
+function authView(signup=false) {
+  clearTimeout(timer); user=null; page='auth';
+  app.innerHTML=`<div class="auth-layout"><section class="auth-story"><div class="brand"><span class="mark">≡</span>Накладная</div><h1>От фото<br>до порядка<br>в вашей 1С.</h1><p>Распознайте накладную, сверьте товары с каталогом магазина и сохраните готовый Excel.</p><div class="flow"><span>01 &nbsp; Фото или скан документа</span><span>02 &nbsp; Точные названия из вашей базы</span><span>03 &nbsp; Проверка и выгрузка в Excel</span></div></section><section class="auth-panel"><div class="auth-box"><div class="eyebrow">Рабочее пространство магазина</div><h2>${signup?'Подключить магазин':'С возвращением'}</h2><p class="muted">${signup?'Создайте отдельный аккаунт для вашего магазина.':'Войдите, чтобы продолжить работу с накладными.'}</p><form id="auth-form" data-signup="${signup}">${signup?'<div class="field"><label for="store-name">Название магазина</label><input id="store-name" name="store_name" required minlength="2" maxlength="255" autocomplete="organization" placeholder="Например, Магазин у дома"></div>':''}<div class="field"><label for="username">Логин</label><input id="username" name="username" required minlength="3" maxlength="100" pattern="[a-zA-Z0-9_.@\-]+" autocomplete="username" placeholder="Латинские буквы или email"></div><div class="field"><label for="password">Пароль</label><input id="password" type="password" name="password" required ${signup?'minlength="10"':''} maxlength="72" autocomplete="${signup?'new-password':'current-password'}">${signup?'<small>От 10 символов</small>':''}</div><div id="auth-error" role="alert"></div><button class="btn primary" type="submit">${signup?'Создать магазин':'Войти в аккаунт'} <span>→</span></button></form><div class="auth-switch">${signup?'Уже есть аккаунт?':'Первый раз здесь?'} <button class="link" data-action="auth-switch" data-signup="${!signup}">${signup?'Войти':'Подключить магазин'}</button></div><p class="auth-note">Документы и каталог доступны только сотрудникам вашего магазина.</p></div></section></div>`;
 }
-
-function showLogin() {
-    document.getElementById('page-login').classList.add('active');
-    document.querySelectorAll('.page:not(#page-login)').forEach(p => p.classList.remove('active'));
-    document.getElementById('page-login').innerHTML = `
-        <div class="login-container">
-            <h1>📋 Invoice App</h1>
-            <div class="form-group">
-                <label>Пользователь</label>
-                <input type="text" id="login-user" value="admin">
-            </div>
-            <div class="form-group">
-                <label>Пароль</label>
-                <input type="password" id="login-pass" value="admin">
-            </div>
-            <div id="login-error" style="color:red;margin-bottom:12px"></div>
-            <button class="btn btn-primary btn-block" onclick="login()">Войти</button>
-        </div>`;
+function shell() {
+  const admin=['super_admin','store_admin'].includes(user.role);
+  app.innerHTML=`<div class="shell"><aside class="sidebar"><div><div class="brand"><span class="mark">≡</span>Накладная</div><small>Порядок начинается с документа</small></div><nav class="nav" aria-label="Основное меню"><button data-page="dashboard"><span class="nav-icon">◫</span>Обзор</button><button data-page="documents"><span class="nav-icon">▤</span>Накладные</button><button data-page="products"><span class="nav-icon">▦</span>Каталог 1С</button>${admin?'<button data-page="users"><span class="nav-icon">♧</span>Команда</button><button data-page="settings"><span class="nav-icon">⚙</span>Настройки</button>':''}</nav><div class="sidebar-bottom"><small>Ваш аккаунт</small><span>${esc(user.full_name || user.username)}</span><button data-action="logout">Выйти из аккаунта ↗</button></div></aside><div class="workspace"><header class="topbar"><span id="store-label">Рабочее пространство</span><div class="actions">${user.role==='super_admin'?'<select id="store-select" class="store-select" aria-label="Выбрать магазин"><option value="">Выберите магазин</option></select>':''}<button class="btn small" data-action="logout" aria-label="Выйти">Выйти</button><span class="avatar">${esc(user.username.slice(0,2).toUpperCase())}</span></div></header><main id="content" class="content"></main></div></div>`;
+  api('/stores/').then(stores=>{const store=stores.find(s=>s.id===(Number(selectedStore)||user.store_id));document.querySelector('#store-label').textContent=store?.name || 'Выберите магазин';const select=document.querySelector('#store-select');if(select){for(const s of stores){const o=new Option(s.name,s.id);select.add(o);}select.value=selectedStore;}}).catch(e=>toast(e.message));
 }
-
-async function showApp() {
-    try {
-        currentUser = await api('/auth/me');
-    } catch { showLogin(); return; }
-    document.getElementById('user-info').textContent = currentUser.full_name || currentUser.username;
-    document.getElementById('page-login').classList.remove('active');
-    showPage('dashboard');
+const head=(title,subtitle,actions='')=>`<div class="page-head"><div><div class="eyebrow">Ваш магазин · каждый день проще</div><h1>${esc(title)}</h1><p>${esc(subtitle)}</p></div><div class="actions">${actions}</div></div>`;
+const empty=(title,text,button='')=>`<div class="empty"><div class="symbol">▤</div><h3>${esc(title)}</h3><p>${esc(text)}</p>${button}</div>`;
+async function navigate(next) {
+  clearTimeout(timer);page=next;currentDoc=null;
+  document.querySelectorAll('[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===next));
+  const content=document.querySelector('#content');content.innerHTML='<p class="loading">Загрузка…</p>';
+  if(user.role==='super_admin' && !selectedStore){content.innerHTML=head('Магазины','Выберите магазин в верхнем меню, чтобы открыть его рабочее пространство.');return;}
+  try {await ({dashboard:dashboard,documents:documents,products:products,users:users,settings:settings}[next] || dashboard)();}
+  catch(e){if(page!=='auth')content.innerHTML=`<div class="error">${esc(e.message)}</div>`;}
 }
-
-// ============================================================
-// Navigation
-// ============================================================
-function showPage(page) {
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    const el = document.getElementById('page-' + page);
-    if (el) el.classList.add('active');
-    document.querySelectorAll('.nav-links a').forEach(a => {
-        a.classList.toggle('active', a.dataset.page === page);
-    });
-    const loaders = {
-        dashboard: loadDashboard,
-        documents: loadDocuments,
-        products: loadProducts,
-        users: loadUsers,
-        stores: loadStores,
-        aliases: loadAliases,
-        'ai-stats': loadAiStats,
-        settings: loadSettings,
-    };
-    if (loaders[page]) loaders[page]();
+async function dashboard() {
+  const data=await api('/stats/dashboard');
+  document.querySelector('#content').innerHTML=head('Рабочий день без ручного ввода','Все накладные и товары магазина — в одном месте.','<button class="btn primary" data-action="upload">＋ Новая накладная</button>')+`<div class="metrics">${[['Все накладные',data.documents,'В вашем пространстве'],['Ждут проверки',data.needs_review,'Сверьте перед выгрузкой'],['Проверены',data.confirmed,'Готовы к Excel'],['Товары в каталоге',data.catalog,'Названия из вашей 1С']].map(([title,value,note])=>`<div class="metric"><strong>${title}</strong><div class="value">${value}</div><p>${note}</p></div>`).join('')}</div><div class="hero"><div><div class="eyebrow">От документа к результату</div><h2>Фотографируйте накладную.<br>Остальное — здесь.</h2><p>Распознавание через Mistral и сопоставление с вашим каталогом. Вы проверяете результат и получаете Excel для загрузки в 1С.</p><button class="btn primary" data-action="${data.catalog?'upload':'catalog-import'}">${data.catalog?'Загрузить накладную →':'Начать с каталога →'}</button></div><div class="steps"><div class="step"><b>1</b><span>Загрузите каталог товаров из 1С</span></div><div class="step"><b>2</b><span>Добавьте фото или PDF накладной</span></div><div class="step"><b>3</b><span>Проверьте товары и скачайте Excel</span></div></div></div><div class="card"><div class="card-title"><h3>Последние накладные</h3><button class="btn small" data-page="documents">Все документы →</button></div><div id="recent"></div></div>`;
+  const docs=await api('/documents/?limit=5');document.querySelector('#recent').innerHTML=documentTable(docs.items);
 }
-
-function toggleSidebar() {
-    document.getElementById('sidebar').classList.toggle('open');
-}
-
-// ============================================================
-// Dashboard
-// ============================================================
-async function loadDashboard() {
-    const el = document.getElementById('page-dashboard');
-    try {
-        const data = await api('/stats/dashboard?period=month');
-        el.innerHTML = `
-            <h1 style="margin-bottom:24px">Dashboard</h1>
-            <div class="dashboard-grid">
-                <div class="stat-card"><h3>Сегодня</h3><div class="value">${data.today_count}</div></div>
-                <div class="stat-card"><h3>За месяц</h3><div class="value">${data.period_count}</div></div>
-                <div class="stat-card"><h3>Требуют проверки</h3><div class="value warning">${data.needs_review}</div></div>
-                <div class="stat-card"><h3>Отправлено в 1С</h3><div class="value success">${data.sent_to_1c}</div></div>
-                <div class="stat-card"><h3>Ошибок</h3><div class="value danger">${data.errors}</div></div>
-                <div class="stat-card"><h3>Mistral запросов</h3><div class="value">${data.ai_requests}</div></div>
-            </div>`;
-    } catch (e) { el.innerHTML = `<p>Ошибка: ${e.message}</p>`; }
-}
-
-// ============================================================
-// Documents
-// ============================================================
-async function loadDocuments() {
-    const el = document.getElementById('page-documents');
-    try {
-        const data = await api('/documents/');
-        const items = data.items || [];
-        el.innerHTML = `
-            <div class="card-header"><h2>Накладные</h2>
-                <button class="btn btn-primary" onclick="showUploadModal()">+ Загрузить</button>
-            </div>
-            <div class="card-body">
-                <table>
-                    <thead><tr>
-                        <th>№</th><th>Поставщик</th><th>Статус</th><th>Товаров</th><th>Дата</th><th></th>
-                    </tr></thead>
-                    <tbody>
-                        ${items.map(d => `<tr>
-                            <td>#${d.id}</td>
-                            <td>${d.supplier || '—'}</td>
-                            <td><span class="badge badge-${d.status}">${d.status}</span></td>
-                            <td>${d.total_items}</td>
-                            <td>${d.created_at ? new Date(d.created_at).toLocaleDateString() : '—'}</td>
-                            <td><button class="btn btn-sm btn-outline" onclick="showDocument(${d.id})">Открыть</button></td>
-                        </tr>`).join('')}
-                    </tbody>
-                </table>
-                ${items.length === 0 ? '<p style="text-align:center;padding:40px;color:#999">Нет документов</p>' : ''}
-            </div>`;
-    } catch (e) { el.innerHTML = `<p>Ошибка: ${e.message}</p>`; }
-}
-
+function documentTable(items) {return items.length?`<div class="table-wrap"><table><thead><tr><th>Документ</th><th>Поставщик</th><th>Статус</th><th>Строк</th><th>Добавлен</th><th></th></tr></thead><tbody>${items.map(d=>`<tr><td><b>Накладная #${d.id}</b></td><td>${esc(d.supplier || 'Не указан')}</td><td>${badge(d.status)}</td><td>${d.total_items}</td><td>${date(d.created_at)}</td><td><button class="btn small" data-action="document" data-id="${d.id}">Открыть →</button></td></tr>`).join('')}</tbody></table></div>`:empty('Здесь появятся ваши накладные','Загрузите первый документ — фото с телефона или скан в PDF.','<button class="btn" data-action="upload">Загрузить документ</button>');}
+async function documents() {const data=await api('/documents/?limit=200');document.querySelector('#content').innerHTML=head('Накладные','Загрузка, распознавание и проверка перед выгрузкой.','<button class="btn primary" data-action="upload">＋ Новая накладная</button>')+`<div class="card">${documentTable(data.items)}</div>`;if(data.items.some(d=>['processing','retry_pending'].includes(d.status)))timer=setTimeout(()=>{if(page==='documents')documents().catch(e=>toast(e.message));},3000);}
+function uploadModal() {openModal('Новая накладная',`<form id="upload-form"><div class="file-drop"><label for="invoice-file">Фото с телефона или скан документа</label><input id="invoice-file" name="file" type="file" accept="image/jpeg,image/png,image/webp,application/pdf" required><small>JPG, PNG, WebP или PDF · до 20 МБ · до 30 страниц</small></div><div class="field"><label for="supplier">Поставщик (необязательно)</label><input id="supplier" name="supplier" maxlength="500" placeholder="Название поставщика"></div><p class="muted">Файл отправляется в Mistral для распознавания. Результат можно проверить и исправить перед выгрузкой.</p><div class="form-error" role="alert"></div><button class="btn primary" type="submit">Загрузить и распознать →</button></form>`);}
 async function showDocument(id) {
-    const el = document.getElementById('page-document-detail');
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    el.classList.add('active');
-    try {
-        const data = await api(`/documents/${id}`);
-        const doc = data.document;
-        const items = data.items || [];
-        el.innerHTML = `
-            <div style="margin-bottom:16px">
-                <button class="btn btn-outline" onclick="showPage('documents')">← Назад</button>
-                <span class="badge badge-${doc.status}" style="margin-left:12px">${doc.status}</span>
-                ${doc.status === 'needs_review' || doc.status === 'recognized' ?
-                    `<button class="btn btn-success" style="margin-left:12px" onclick="confirmDocument(${doc.id})">✔ Подтвердить</button>` : ''}
-            </div>
-            <div class="doc-layout">
-                <div class="doc-image">
-                    <img src="/api/documents/${doc.id}/image" alt="Накладная"
-                         onerror="this.style.display='none'">
-                </div>
-                <div>
-                    <div class="card" style="margin-bottom:16px">
-                        <div class="card-body">
-                            <p><strong>Поставщик:</strong> ${doc.supplier || '—'}</p>
-                            <p><strong>Номер:</strong> ${doc.document_number || '—'}</p>
-                            <p><strong>Дата:</strong> ${doc.document_date || '—'}</p>
-                            <p><strong>Статус:</strong> <span class="badge badge-${doc.status}">${doc.status}</span></p>
-                        </div>
-                    </div>
-                    <div class="card">
-                        <div class="card-header"><h2>Товары (${items.length})</h2></div>
-                        <div class="card-body" style="overflow-x:auto">
-                            <table>
-                                <thead><tr><th>№</th><th>Распознано</th><th>Товар 1С</th><th>Кол-во</th><th>Цена</th><th>Статус</th><th></th></tr></thead>
-                                <tbody>
-                                    ${items.map(i => `<tr>
-                                        <td>${i.row_number}</td>
-                                        <td>${i.ocr_text || i.product_name || '—'}</td>
-                                        <td>${i.product_name || 'Не найдено'}</td>
-                                        <td>${i.quantity || '—'}</td>
-                                        <td>${i.price || '—'}</td>
-                                        <td><span class="badge badge-${i.match_status}">${i.match_status}</span></td>
-                                        <td><button class="btn btn-sm btn-outline" onclick="editItem(${doc.id},${i.id})">Изменить</button></td>
-                                    </tr>`).join('')}
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-            </div>`;
-    } catch (e) { el.innerHTML = `<p>Ошибка: ${e.message}</p>`; }
+  clearTimeout(timer);page='detail';currentDoc=Number(id);
+  const data=await api(`/documents/${id}`), d=data.document, items=data.items;
+  if(currentDoc!==Number(id))return;
+  const busy=['processing','retry_pending'].includes(d.status);
+  const total=items.reduce((sum,i)=>sum+Number(i.total || 0),0);
+  document.querySelector('#content').innerHTML=head(`Накладная #${id}`,`${d.supplier || 'Поставщик не указан'} · ${date(d.created_at)}`,'<button class="btn" data-page="documents">← К списку</button>')+`${d.error_message?`<div class="error">${esc(d.error_message)}</div>`:''}${busy?'<div class="notice">Распознаём документ через Mistral. Можно закрыть страницу — обработка продолжится на сервере.</div>':''}<div class="split"><aside class="card preview"><div class="card-title"><h3>Оригинал</h3>${badge(d.status)}</div><div class="card-body" id="preview"><p class="muted">Загружаем документ…</p></div></aside><section class="card"><div class="card-title"><div><h3>Проверьте товары</h3><small class="muted">Название в Excel будет точно как в каталоге 1С</small></div><span class="badge">${items.length} строк</span></div>${items.length?`<div class="table-wrap"><table class="review-table"><thead><tr><th>Товар из каталога / в накладной</th><th>Кол-во</th><th>Цена</th><th>Сумма</th><th></th></tr></thead><tbody>${items.map(i=>`<tr data-row="${i.id}"><td><button class="product-button" data-action="choose-product" data-id="${i.id}">${esc(i.product_name || i.ocr_text)}</button><span class="ocr">В документе: ${esc(i.ocr_text)}</span>${badge(i.match_status)}</td><td><input aria-label="Количество, строка ${i.row_number}" data-quantity type="number" min="0.001" step="0.001" value="${esc(i.quantity ?? '')}"></td><td><input aria-label="Цена, строка ${i.row_number}" data-price type="number" min="0" step="0.01" value="${esc(i.price ?? '')}"></td><td class="number">${money(i.total)}</td><td><button class="btn small" data-action="save-row" data-id="${i.id}">Сохранить</button></td></tr>`).join('')}</tbody></table></div><div class="review-footer"><span>Итого: <b class="number">${money(total)}</b></span><div class="actions"><button class="btn" data-action="confirm" data-id="${id}">✓ Всё проверено</button><button class="btn primary" data-action="export" data-id="${id}" ${d.status!=='confirmed'?'disabled':''}>Скачать Excel ↓</button></div></div>`:empty(busy?'Документ обрабатывается':'Документ готов к распознаванию',busy?'Товары появятся здесь после обработки.':'Запустите OCR, чтобы получить строки накладной.',!busy?`<button class="btn primary" data-action="process" data-id="${id}">${d.status==='error'?'Повторить распознавание':'Распознать документ'}</button>`:'')}</section></div><p class="muted">Сначала выберите товары для спорных строк, сохраните исправления и нажмите «Всё проверено». Excel предназначен для загрузки через обработку импорта вашей конфигурации 1С.</p>`;
+  const image=await request(`/documents/${id}/image`);const blob=await image.blob();
+  if(previewUrl)URL.revokeObjectURL(previewUrl);previewUrl=URL.createObjectURL(blob);
+  if(currentDoc===Number(id)){const preview=document.querySelector('#preview');preview.innerHTML=d.file_type==='.pdf'?`<iframe title="Оригинал накладной" src="${previewUrl}"></iframe>`:`<img alt="Оригинал накладной" src="${previewUrl}">`;}
+  if(busy)timer=setTimeout(()=>{if(currentDoc===Number(id))showDocument(id).catch(e=>toast(e.message));},3000);
 }
-
-async function confirmDocument(id) {
-    await api(`/documents/${id}/confirm`, { method: 'POST' });
-    showDocument(id);
+async function chooseProduct(itemId) {
+  openModal('Выберите товар из 1С',`<form id="match-form" data-item="${itemId}"><div class="field"><label for="product-search">Поиск по названию, артикулу или штрихкоду</label><input id="product-search" placeholder="Например, Шадринское"></div><div id="product-results" class="search-results">Ищем подходящие товары…</div><input type="hidden" name="product_id" required><label class="check"><input type="checkbox" name="create_alias" checked>Запомнить это название для моего магазина</label><div class="form-error" role="alert"></div><div class="actions"><button class="btn primary" type="submit">Выбрать товар</button></div></form>`);
+  const data=await api(`/documents/${currentDoc}/items/${itemId}/suggestions`);renderCandidates(data.items);
 }
-
-// ============================================================
-// Upload
-// ============================================================
-function showUploadModal() {
-    openModal('Загрузить накладную', `
-        <div class="form-group">
-            <label>Поставщик</label>
-            <input type="text" id="upload-supplier" placeholder="Название поставщика">
-        </div>
-        <div class="form-group">
-            <label>Файл</label>
-            <input type="file" id="upload-file" accept="image/*,.pdf">
-        </div>
-        <button class="btn btn-primary btn-block" onclick="uploadDocument()">Загрузить</button>
-    `);
+function renderCandidates(items){const el=document.querySelector('#product-results');if(el)el.innerHTML=items.length?items.map(p=>`<button type="button" class="result" data-action="pick-product" data-id="${p.id}"><b>${esc(p.name)}</b><small>Код: ${esc(p.one_c_id)} · ${esc(p.unit || '—')} · ${esc(p.barcode || p.article || '')}</small></button>`).join(''):'<p class="muted">Совпадений нет. Попробуйте одно слово или загрузите актуальный каталог из 1С.</p>';}
+async function products(search='') {
+  const data=await api(`/products/?limit=50&offset=${catalogOffset}${search?'&search='+encodeURIComponent(search):''}`);
+  document.querySelector('#content').innerHTML=head('Каталог из 1С','Единые названия, коды и единицы измерения вашего магазина.',user.role!=='operator'?'<button class="btn primary" data-action="catalog-import">↑ Загрузить каталог</button>':'')+`<form id="catalog-search" class="toolbar"><input name="search" aria-label="Поиск товаров" placeholder="Поиск по названию, артикулу или штрихкоду" value="${esc(search)}"><button class="btn" type="submit">Найти</button><span class="muted">${data.total} товаров</span></form><div class="card">${data.items.length?`<div class="table-wrap"><table><thead><tr><th>Код 1С</th><th>Название в базе</th><th>Артикул</th><th>Штрихкод</th><th>Единица</th></tr></thead><tbody>${data.items.map(p=>`<tr><td>${esc(p.one_c_id)}</td><td><b>${esc(p.name)}</b></td><td>${esc(p.article || '—')}</td><td>${esc(p.barcode || '—')}</td><td>${esc(p.unit || '—')}</td></tr>`).join('')}</tbody></table></div>${!search?`<div class="pagination"><button class="btn small" data-action="catalog-prev" ${catalogOffset===0?'disabled':''}>← Назад</button><button class="btn small" data-action="catalog-next" ${catalogOffset+50>=data.total?'disabled':''}>Далее →</button></div>`:''}`:empty('Добавьте ваш каталог','Выгрузите номенклатуру из 1С в XLSX или CSV. Сайт будет использовать именно эти названия.','<button class="btn" data-action="template">Скачать шаблон ↓</button>')}</div><div class="notice">Например, «Молоко Шадринское 5% 1л» сопоставляется с «Шадринское Молоко 1л 5%». Товары с другой жирностью или объёмом требуют отдельного выбора.</div>`;
 }
+function catalogModal(){openModal('Загрузить каталог',`<p class="muted">Коды и названия должны точно совпадать с номенклатурой вашей 1С. Повторная загрузка обновляет товары по коду.</p><button class="btn" data-action="template">Скачать шаблон XLSX ↓</button><form id="catalog-form"><div class="field"><label for="catalog-file">Файл XLSX или CSV</label><input id="catalog-file" type="file" name="file" accept=".xlsx,.csv" required><small>До 10 МБ и 10 000 строк. Коды и штрихкоды храните как текст.</small></div><div class="form-error" role="alert"></div><button class="btn primary" type="submit">Импортировать каталог</button></form>`);}
+async function users(){const data=await api('/users/');document.querySelector('#content').innerHTML=head('Команда магазина','Каждый сотрудник входит под своим аккаунтом.','<button class="btn primary" data-action="add-user">＋ Добавить сотрудника</button>')+`<div class="card"><div class="table-wrap"><table><thead><tr><th>Сотрудник</th><th>Логин</th><th>Роль</th><th>Статус</th></tr></thead><tbody>${data.map(u=>`<tr><td>${esc(u.full_name || '—')}</td><td>${esc(u.username)}</td><td>${esc({super_admin:'Владелец сервиса',store_admin:'Администратор',operator:'Оператор'}[u.role])}</td><td>${u.is_active?'Активен':'Отключён'}</td></tr>`).join('')}</tbody></table></div></div>`;}
+function userModal(){openModal('Новый сотрудник',`<form id="user-form"><div class="field"><label>Имя<input name="full_name" maxlength="255" required></label></div><div class="field"><label>Логин<input name="username" minlength="3" maxlength="100" pattern="[a-zA-Z0-9_.@\-]+" required autocomplete="off"></label></div><div class="field"><label>Пароль<input name="password" type="password" minlength="10" maxlength="72" required autocomplete="new-password"></label></div><div class="field"><label>Роль<select name="role"><option value="operator">Оператор: накладные и Excel</option><option value="store_admin">Администратор: каталог и команда</option></select></label></div><div class="form-error" role="alert"></div><button class="btn primary" type="submit">Создать аккаунт</button></form>`);}
+async function settings(){const data=await api('/settings/');document.querySelector('#content').innerHTML=head('Настройки','Подключение распознавания и правила работы магазина.')+`<div class="card"><div class="card-title"><h3>Mistral OCR</h3>${badge(data.ocr_configured?'confirmed':'error')}</div><div class="card-body"><p>${data.ocr_configured?'Распознавание настроено на сервере.':'Владелец сервиса должен добавить ключ Mistral на сервере.'}</p><p class="muted">До ${data.max_upload_mb} МБ и ${data.max_pages} страниц на документ. Неуверенные совпадения требуют ручной проверки.</p><p class="notice">${esc(data.export_note)}</p></div></div>`;}
 
-async function uploadDocument() {
-    const file = document.getElementById('upload-file').files[0];
-    const supplier = document.getElementById('upload-supplier').value;
-    if (!file) return alert('Выберите файл');
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('supplier', supplier);
-    try {
-        const res = await fetch(API + '/documents/upload', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` },
-            body: formData,
-        });
-        const doc = await res.json();
-        closeModal();
-        showDocument(doc.id);
-        await api(`/documents/${doc.id}/process`, { method: 'POST' });
-        showDocument(doc.id);
-    } catch (e) { alert('Ошибка: ' + e.message); }
-}
-
-// ============================================================
-// Edit Item
-// ============================================================
-async function editItem(docId, itemId) {
-    const data = await api(`/documents/${docId}`);
-    const item = data.items.find(i => i.id === itemId);
-    if (!item) return;
-
-    openModal('Изменить строку', `
-        <div class="form-group">
-            <label>Распознано:</label>
-            <p>${item.ocr_text || item.product_name}</p>
-        </div>
-        <div class="form-group">
-            <label>Поиск товара:</label>
-            <input type="text" id="edit-search" onkeyup="searchProductsForEdit(this.value)" placeholder="Введите название...">
-            <div id="edit-search-results" style="max-height:200px;overflow-y:auto;margin-top:8px"></div>
-        </div>
-        <input type="hidden" id="edit-product-id" value="${item.product_id || ''}">
-        <div class="form-group"><label>Количество</label><input type="number" id="edit-qty" value="${item.quantity || ''}"></div>
-        <div class="form-group"><label>Цена</label><input type="number" id="edit-price" value="${item.price || ''}"></div>
-        <div class="form-group">
-            <label><input type="checkbox" id="edit-alias"> Запомнить для будущих накладных</label>
-        </div>
-        <button class="btn btn-primary btn-block" onclick="saveItem(${docId},${itemId})">Сохранить</button>
-    `);
-}
-
-let editSearchTimeout;
-function searchProductsForEdit(query) {
-    clearTimeout(editSearchTimeout);
-    if (query.length < 2) return;
-    editSearchTimeout = setTimeout(async () => {
-        const products = await api(`/matching/search?q=${encodeURIComponent(query)}`);
-        const el = document.getElementById('edit-search-results');
-        el.innerHTML = products.map(p => `
-            <div style="padding:8px;cursor:pointer;border:1px solid #e2e8f0;border-radius:4px;margin-bottom:4px"
-                 onclick="selectProduct(${p.id},'${p.name.replace(/'/g,"\\'")}')">
-                <strong>${p.name}</strong><br>
-                <small>${p.article || ''} ${p.barcode || ''}</small>
-            </div>
-        `).join('') || '<p style="color:#999;padding:8px">Не найдено</p>';
-    }, 300);
-}
-
-function selectProduct(id, name) {
-    document.getElementById('edit-product-id').value = id;
-    document.getElementById('edit-search').value = name;
-    document.getElementById('edit-search-results').innerHTML = '';
-}
-
-async function saveItem(docId, itemId) {
-    const productId = document.getElementById('edit-product-id').value;
-    const qty = document.getElementById('edit-qty').value;
-    const price = document.getElementById('edit-price').value;
-    const createAlias = document.getElementById('edit-alias').checked;
-
-    const params = new URLSearchParams();
-    if (productId) params.set('product_id', productId);
-    if (qty) params.set('quantity', qty);
-    if (price) params.set('price', price);
-    params.set('create_alias', createAlias);
-
-    await api(`/documents/${docId}/items/${itemId}?${params}`, { method: 'PUT' });
-    closeModal();
-    showDocument(docId);
-}
-
-// ============================================================
-// Products, Users, Stores, Aliases, AI Stats, Settings
-// ============================================================
-async function loadProducts() {
-    const el = document.getElementById('page-products');
-    const data = await api('/products/');
-    const items = data.items || [];
-    el.innerHTML = `
-        <div class="card-header"><h2>Каталог товаров</h2></div>
-        <div class="card-body">
-            <table>
-                <thead><tr><th>ID</th><th>Название</th><th>Артикул</th><th>Штрихкод</th><th>Ед.</th><th>Цена</th></tr></thead>
-                <tbody>
-                    ${items.map(p => `<tr>
-                        <td>${p.id}</td><td>${p.name}</td><td>${p.article || '—'}</td>
-                        <td>${p.barcode || '—'}</td><td>${p.unit || '—'}</td><td>${p.price || '—'}</td>
-                    </tr>`).join('')}
-                </tbody>
-            </table>
-        </div>`;
-}
-
-async function loadUsers() {
-    const el = document.getElementById('page-users');
-    const data = await api('/users/');
-    el.innerHTML = `
-        <div class="card-header"><h2>Пользователи</h2></div>
-        <div class="card-body">
-            <table>
-                <thead><tr><th>ID</th><th>Имя</th><th>Логин</th><th>Роль</th><th>Telegram</th><th>Статус</th></tr></thead>
-                <tbody>
-                    ${(data || []).map(u => `<tr>
-                        <td>${u.id}</td><td>${u.full_name || '—'}</td><td>${u.username}</td>
-                        <td>${u.role}</td><td>${u.telegram_chat_id || '—'}</td>
-                        <td>${u.is_active ? '✅' : '❌'}</td>
-                    </tr>`).join('')}
-                </tbody>
-            </table>
-        </div>`;
-}
-
-async function loadStores() {
-    const el = document.getElementById('page-stores');
-    const data = await api('/stores/');
-    el.innerHTML = `
-        <div class="card-header"><h2>Магазины</h2></div>
-        <div class="card-body">
-            <table>
-                <thead><tr><th>ID</th><th>Название</th><th>Код</th><th>ИНН</th><th>Статус</th></tr></thead>
-                <tbody>
-                    ${(data || []).map(s => `<tr>
-                        <td>${s.id}</td><td>${s.name}</td><td>${s.code}</td>
-                        <td>${s.inn || '—'}</td><td>${s.is_active ? '✅' : '❌'}</td>
-                    </tr>`).join('')}
-                </tbody>
-            </table>
-        </div>`;
-}
-
-async function loadAliases() {
-    const el = document.getElementById('page-aliases');
-    const data = await api('/matching/aliases');
-    el.innerHTML = `
-        <div class="card-header"><h2>Синонимы (Aliases)</h2></div>
-        <div class="card-body">
-            <table>
-                <thead><tr><th>OCR текст</th><th>Нормализованный</th><th>Product ID</th><th>Использований</th><th></th></tr></thead>
-                <tbody>
-                    ${(data || []).map(a => `<tr>
-                        <td>${a.ocr_text}</td><td>${a.normalized_text}</td>
-                        <td>${a.product_id}</td><td>${a.usage_count}</td>
-                        <td><button class="btn btn-sm btn-danger" onclick="deleteAlias(${a.id})">Удалить</button></td>
-                    </tr>`).join('')}
-                </tbody>
-            </table>
-        </div>`;
-}
-
-async function deleteAlias(id) {
-    if (!confirm('Удалить синоним?')) return;
-    await api(`/matching/aliases/${id}`, { method: 'DELETE' });
-    loadAliases();
-}
-
-async function loadAiStats() {
-    const el = document.getElementById('page-ai-stats');
-    const data = await api('/stats/ai-usage');
-    const s = data.stats || {};
-    el.innerHTML = `
-        <h1 style="margin-bottom:24px">Mistral Статистика</h1>
-        <div class="dashboard-grid">
-            <div class="stat-card"><h3>Запросов</h3><div class="value">${s.total_requests || 0}</div></div>
-            <div class="stat-card"><h3>Токенов</h3><div class="value">${s.total_tokens || 0}</div></div>
-            <div class="stat-card"><h3>Стоимость</h3><div class="value">$${(s.total_cost || 0).toFixed(4)}</div></div>
-            <div class="stat-card"><h3>Ошибок</h3><div class="value danger">${s.errors || 0}</div></div>
-        </div>`;
-}
-
-async function loadSettings() {
-    const el = document.getElementById('page-settings');
-    const data = await api('/settings/');
-    el.innerHTML = `
-        <h1 style="margin-bottom:24px">Настройки</h1>
-        <div class="card"><div class="card-body">
-            ${Object.entries(data || {}).map(([k, v]) => `
-                <div class="form-group">
-                    <label>${k}</label>
-                    <input type="text" id="setting-${k}" value="${v.value}">
-                </div>
-            `).join('')}
-            <button class="btn btn-primary" onclick="saveSettings()">Сохранить</button>
-        </div></div>`;
-}
-
-async function saveSettings() {
-    const inputs = document.querySelectorAll('[id^="setting-"]');
-    for (const input of inputs) {
-        const key = input.id.replace('setting-', '');
-        let value = input.value;
-        if (!isNaN(value) && value !== '') value = Number(value);
-        await api('/settings/', {
-            method: 'PUT',
-            body: JSON.stringify({ key, value }),
-        });
-    }
-    alert('Настройки сохранены');
-}
-
-// ============================================================
-// Modal
-// ============================================================
-function openModal(title, content) {
-    document.getElementById('modal-title').textContent = title;
-    document.getElementById('modal-content').innerHTML = content;
-    document.getElementById('modal-overlay').classList.add('active');
-}
-
-function closeModal() {
-    document.getElementById('modal-overlay').classList.remove('active');
-}
-
-// ============================================================
-// Init
-// ============================================================
-if (token) { showApp(); } else { showLogin(); }
+document.addEventListener('click',async event=>{
+  const button=event.target.closest('button');if(!button || button.disabled)return;
+  if(button.dataset.page){await navigate(button.dataset.page);return;}
+  const action=button.dataset.action,id=button.dataset.id;if(!action)return;
+  try {
+    if(action==='close'){closeModal();return;}
+    if(action==='auth-switch'){authView(button.dataset.signup==='true');return;}
+    if(action==='upload'){uploadModal();return;}
+    if(action==='catalog-import'){catalogModal();return;}
+    if(action==='add-user'){userModal();return;}
+    if(action==='pick-product'){document.querySelector('#match-form [name=product_id]').value=id;document.querySelectorAll('.result').forEach(b=>b.classList.toggle('selected',b===button));return;}
+    button.disabled=true;
+    if(action==='logout'){await api('/auth/logout',{method:'POST'});selectedStore='';sessionStorage.removeItem('store');authView();}
+    if(action==='document')await showDocument(id);
+    if(action==='process'){await api(`/documents/${id}/process`,{method:'POST'});await showDocument(id);}
+    if(action==='confirm'){if(document.querySelector('[data-dirty]'))throw new Error('Сначала сохраните изменённые строки');await api(`/documents/${id}/confirm`,{method:'POST'});toast('Накладная проверена. Можно скачать Excel.');await showDocument(id);}
+    if(action==='export'){if(document.querySelector('[data-dirty]'))throw new Error('Сначала сохраните исправления и подтвердите накладную заново');await download(`/documents/${id}/export`,`invoice-${id}.xlsx`);}
+    if(action==='template')await download('/products/template','catalog-template.xlsx');
+    if(action==='choose-product')await chooseProduct(id);
+    if(action==='save-row'){const row=button.closest('[data-row]');const quantity=row.querySelector('[data-quantity]').value,price=row.querySelector('[data-price]').value;if(!quantity || !price)throw new Error('Заполните количество и цену');await api(`/documents/${currentDoc}/items/${id}`,{method:'PUT',body:JSON.stringify({quantity,price})});toast('Строка сохранена');await showDocument(currentDoc);}
+    if(action==='catalog-next'){catalogOffset+=50;await products();}
+    if(action==='catalog-prev'){catalogOffset=Math.max(0,catalogOffset-50);await products();}
+  }catch(e){toast(e.message);}finally{button.disabled=false;}
+});
+document.addEventListener('submit',async event=>{
+  event.preventDefault();const form=event.target,button=form.querySelector('[type=submit]');const data=new FormData(form);if(button)button.disabled=true;
+  const error=form.querySelector('.form-error') || document.querySelector('#auth-error');if(error)error.innerHTML='';
+  try {
+    if(form.id==='auth-form'){const signup=form.dataset.signup==='true';const result=await api(`/auth/${signup?'signup':'login'}`,{method:'POST',body:JSON.stringify(Object.fromEntries(data))});user=result.user;selectedStore='';sessionStorage.removeItem('store');shell();await navigate('dashboard');}
+    if(form.id==='upload-form'){const doc=await api('/documents/upload',{method:'POST',body:data});closeModal();try{await api(`/documents/${doc.id}/process`,{method:'POST'});}catch(e){toast(e.message);}await showDocument(doc.id);}
+    if(form.id==='catalog-form'){const result=await api('/products/import',{method:'POST',body:data});closeModal();toast(`Загружено товаров: ${result.imported}`);catalogOffset=0;await navigate('products');}
+    if(form.id==='catalog-search'){catalogOffset=0;await products(data.get('search'));}
+    if(form.id==='match-form'){if(!data.get('product_id'))throw new Error('Выберите товар из списка');await api(`/documents/${currentDoc}/items/${form.dataset.item}`,{method:'PUT',body:JSON.stringify({product_id:Number(data.get('product_id')),create_alias:data.has('create_alias')})});closeModal();toast('Товар выбран');await showDocument(currentDoc);}
+    if(form.id==='user-form'){await api('/auth/register',{method:'POST',body:JSON.stringify({...Object.fromEntries(data),store_id:Number(selectedStore)||user.store_id})});closeModal();toast('Аккаунт сотрудника создан');await users();}
+  }catch(e){if(error){error.className='error form-error';error.textContent=e.message;}else toast(e.message);}finally{if(button)button.disabled=false;}
+});
+let searchTimer=null;
+document.addEventListener('input',event=>{
+  if(event.target.matches('[data-quantity],[data-price]'))event.target.closest('[data-row]').dataset.dirty='true';
+  if(event.target.id==='product-search'){clearTimeout(searchTimer);const value=event.target.value;searchTimer=setTimeout(async()=>{try{const result=await api('/products/?limit=20&search='+encodeURIComponent(value));if(document.querySelector('#product-search')?.value===value)renderCandidates(result.items);}catch(e){toast(e.message);}},250);}
+});
+document.addEventListener('change',async event=>{if(event.target.id==='store-select'){selectedStore=event.target.value;sessionStorage.setItem('store',selectedStore);document.querySelector('#store-label').textContent=event.target.selectedOptions[0].textContent;await navigate('dashboard');}});
+(async()=>{localStorage.removeItem('token');try{user=await api('/auth/me');shell();await navigate('dashboard');}catch{authView();}})();

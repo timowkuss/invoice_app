@@ -1,324 +1,234 @@
 from __future__ import annotations
-
+import asyncio
 import hashlib
 import os
 import uuid
-from datetime import datetime
-
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
-
-from core.models.user import User
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
+from io import BytesIO
+from pathlib import Path
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field, ConfigDict
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from core.config import UPLOAD_DIR
+from core.database import get_connection, get_transaction
+from core.repositories import DocumentRepo, DocumentItemRepo, ProductRepo, ProductAliasRepo, AuditLogRepo
 from core.models.document import Document
-from core.models.document_item import DocumentItem
-from core.repositories import DocumentRepo, DocumentItemRepo, AuditLogRepo, AiRequestRepo
 from core.models.audit_log import AuditLog
-from core.models.ai_request import AiRequest
-from api.routers.auth import get_current_user, require_admin
-from ocr.pipeline import OcrPipeline
+from core.models.product_alias import ProductAlias
+from core.matching.service import normalize_text, MatchingService
+from core.uploads import read_upload, validate_document, document_path
+from api.routers.auth import require_store
 
-router = APIRouter()
+router=APIRouter()
 
-UPLOAD_DIR = "uploads"
+async def owned_document(doc_id,user):
+    doc=await DocumentRepo.get_by_id(doc_id)
+    if not doc or doc.store_id!=user.store_id:
+        raise HTTPException(404,'Накладная не найдена')
+    return doc
 
+async def lock_document(doc_id,user,conn):
+    await conn.execute('UPDATE documents SET updated_at=updated_at WHERE id=$1 AND store_id=$2',doc_id,user.store_id)
+    return await owned_document(doc_id,user)
 
-@router.post("/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    supplier: str = Form(""),
-    user: User = Depends(get_current_user),
-):
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+async def audit(user,doc_id,action,old=None,new=None):
+    await AuditLogRepo.create(AuditLog(store_id=user.store_id,user_id=user.id,document_id=doc_id,
+        action=action,entity_type='document',entity_id=doc_id,old_value=old,new_value=new))
 
-    content = await file.read()
-    file_hash = hashlib.sha256(content).hexdigest()
-
-    existing = await DocumentRepo.get_by_hash(user.store_id, file_hash)
-    if existing:
-        raise HTTPException(status_code=409, detail="Document already uploaded")
-
-    ext = os.path.splitext(file.filename)[1]
-    filename = f"{uuid.uuid4().hex}{ext}"
-    filepath = os.path.join(UPLOAD_DIR, filename)
-    with open(filepath, "wb") as f:
-        f.write(content)
-
-    doc = Document(
-        store_id=user.store_id,
-        supplier=supplier,
-        original_file_url=filepath,
-        original_file_hash=file_hash,
-        sent_by_user_id=user.id,
-        status="received",
-    )
-    doc = await DocumentRepo.create(doc)
-
-    await AuditLogRepo.create(AuditLog(
-        store_id=user.store_id,
-        user_id=user.id,
-        document_id=doc.id,
-        action="upload",
-        entity_type="document",
-        entity_id=doc.id,
-    ))
-
-    return doc.to_dict()
-
-
-@router.post("/{doc_id}/process")
-async def process_document(
-    doc_id: int,
-    user: User = Depends(get_current_user),
-):
-    doc = await DocumentRepo.get_by_id(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    if doc.store_id != user.store_id and not user.is_super_admin:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    await DocumentRepo.update_status(doc_id, "processing")
-
-    from core.database import get_connection
-    settings_row = await (await get_connection()).fetchrow(
-        "SELECT value FROM app_settings WHERE key = 'mistral_api_key'"
-    )
-    mistral_key = ""
-    if settings_row:
-        mistral_key = str(settings_row["value"])
-
-    if not mistral_key:
-        from config.settings import SettingsManager
-        sm = SettingsManager()
-        mistral_key = sm.settings.mistral_api_key
-
-    pipeline = OcrPipeline(mistral_api_key=mistral_key)
-
+@router.post('/upload',status_code=201)
+async def upload_document(file:UploadFile=File(...),supplier:str=Form('',max_length=500),user=Depends(require_store)):
+    data=await read_upload(file)
+    suffix=Path(file.filename or '').suffix.lower()
+    await asyncio.to_thread(validate_document,data,suffix)
+    digest=hashlib.sha256(data).hexdigest()
+    directory=UPLOAD_DIR / str(user.store_id)
+    directory.mkdir(parents=True,exist_ok=True)
+    path=directory / f'{uuid.uuid4().hex}{suffix}'
     try:
-        result = pipeline.process_file(doc.original_file_url)
-        await DocumentRepo.update_status(doc_id, "recognized")
-    except Exception as e:
-        await DocumentRepo.update_status(doc_id, "error", str(e))
-        raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+        async with get_transaction() as conn:
+            await conn.execute('UPDATE stores SET updated_at=updated_at WHERE id=$1',user.store_id)
+            existing=await DocumentRepo.get_by_hash(user.store_id,digest)
+            if existing:
+                raise HTTPException(409,{'message':'Эта накладная уже загружена','document_id':existing.id})
+            daily=await conn.fetchval('SELECT COUNT(*) FROM documents WHERE store_id=$1 AND created_at>=$2',user.store_id,datetime.utcnow()-timedelta(days=1))
+            if daily>=int(os.getenv('DAILY_UPLOAD_LIMIT','100')):
+                raise HTTPException(429,'Достигнут дневной лимит загрузок магазина')
+            await asyncio.to_thread(path.write_bytes,data)
+            doc=await DocumentRepo.create(Document(store_id=user.store_id,supplier=supplier,original_file_url=str(path),original_file_hash=digest,sent_by_user_id=user.id,status='received'))
+            await audit(user,doc.id,'upload')
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return public_document(doc)
 
-    from core.matching.service import MatchingService
-    matcher = MatchingService()
+def public_document(doc):
+    result=doc.to_dict()
+    result.pop('original_file_url',None)
+    result.pop('original_file_hash',None)
+    result['file_type']=Path(doc.original_file_url).suffix.lower()
+    return result
 
-    items_data = []
-    for i, product in enumerate(result.products, 1):
-        items_data.append({
-            "row_number": i,
-            "product_name": product.name,
-            "article": product.article,
-            "barcode": product.barcode,
-            "quantity": product.quantity,
-            "price": product.price,
-            "total": product.total,
-            "unit": product.unit,
-            "ocr_text": product.name,
-        })
+@router.post('/{doc_id}/process',status_code=202)
+@router.post('/{doc_id}/retry',status_code=202)
+async def process_document(doc_id:int,user=Depends(require_store)):
+    if not os.getenv('MISTRAL_API_KEY'):
+        raise HTTPException(503,'Mistral ещё не настроен')
+    async with get_transaction() as conn:
+        doc=await lock_document(doc_id,user,conn)
+        if doc.status in ('retry_pending','processing'):
+            return {'document_id':doc_id,'status':doc.status}
+        if doc.status not in ('received','error'):
+            raise HTTPException(409,'Документ уже распознан. Отредактируйте результат.')
+        attempts=await conn.fetchval("SELECT COUNT(*) FROM audit_logs WHERE document_id=$1 AND action='queue_ocr'",doc_id)
+        if attempts>=5:
+            raise HTTPException(429,'Лимит повторов OCR исчерпан. Обратитесь в поддержку.')
+        await DocumentRepo.update_status(doc_id,'retry_pending')
+        await audit(user,doc_id,'queue_ocr')
+    return {'document_id':doc_id,'status':'retry_pending'}
 
-    matched_items = await matcher.match_document_items(user.store_id, items_data)
+@router.get('/')
+async def list_documents(status:str|None=None,limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0),user=Depends(require_store)):
+    docs=await DocumentRepo.list_by_store(user.store_id,status=status,limit=limit,offset=offset)
+    return {'items':[public_document(doc) for doc in docs],'total':await DocumentRepo.count_by_store(user.store_id,status)}
 
-    doc_items = []
-    total = len(matched_items)
-    matched_count = 0
-    needs_review_count = 0
+@router.get('/{doc_id}')
+async def get_document(doc_id:int,user=Depends(require_store)):
+    doc=await owned_document(doc_id,user)
+    items=await DocumentItemRepo.list_by_document(doc_id)
+    return {'document':public_document(doc),'items':[item.to_dict() for item in items]}
 
-    for item_data in matched_items:
-        di = DocumentItem(
-            document_id=doc_id,
-            product_id=item_data.get("product_id"),
-            row_number=item_data["row_number"],
-            ocr_text=item_data.get("ocr_text", ""),
-            product_name=item_data.get("product_name", ""),
-            article=item_data.get("article", ""),
-            barcode=item_data.get("barcode", ""),
-            quantity=item_data.get("quantity"),
-            price=item_data.get("price"),
-            total=item_data.get("total"),
-            unit=item_data.get("unit", ""),
-            confidence=item_data.get("confidence"),
-            match_status=item_data.get("match_status", "pending"),
-        )
-        doc_items.append(di)
-        if di.match_status == "matched":
-            matched_count += 1
-        elif di.match_status == "needs_review":
-            needs_review_count += 1
+@router.get('/{doc_id}/image')
+async def image(doc_id:int,user=Depends(require_store)):
+    doc=await owned_document(doc_id,user)
+    path=document_path(doc.original_file_url)
+    return FileResponse(path,headers={'Cache-Control':'private, no-store'})
 
-    await DocumentItemRepo.bulk_create(doc_items)
-    await DocumentRepo.update_counts(doc_id, total, matched_count, needs_review_count)
+@router.get('/{doc_id}/items/{item_id}/suggestions')
+async def suggestions(doc_id:int,item_id:int,user=Depends(require_store)):
+    await owned_document(doc_id,user)
+    item=await DocumentItemRepo.get_by_id(item_id)
+    if not item or item.document_id!=doc_id:
+        raise HTTPException(404,'Строка не найдена')
+    match=await MatchingService().match_product(user.store_id,item.ocr_text,item.article,item.barcode)
+    return {'items':[p.to_dict() for p in match.alternatives],'confidence':match.confidence}
 
-    final_status = "needs_review" if needs_review_count > 0 else "recognized"
-    await DocumentRepo.update_status(doc_id, final_status)
+class ItemUpdate(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+    product_id:int|None=Field(default=None,gt=0)
+    quantity:Decimal|None=Field(default=None,gt=0,le=9999999,max_digits=10,decimal_places=3,allow_inf_nan=False)
+    price:Decimal|None=Field(default=None,ge=0,le=999999999,max_digits=12,decimal_places=2,allow_inf_nan=False)
+    create_alias:bool=False
 
-    await AuditLogRepo.create(AuditLog(
-        store_id=user.store_id,
-        user_id=user.id,
-        document_id=doc_id,
-        action="process",
-        entity_type="document",
-        entity_id=doc_id,
-        new_value={"total": total, "matched": matched_count, "needs_review": needs_review_count},
-    ))
-
-    return {
-        "document_id": doc_id,
-        "status": final_status,
-        "total_items": total,
-        "matched_items": matched_count,
-        "needs_review_items": needs_review_count,
-    }
-
-
-@router.get("/")
-async def list_documents(
-    status: str | None = None,
-    supplier: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-    user: User = Depends(get_current_user),
-):
-    docs = await DocumentRepo.list_by_store(
-        user.store_id, status=status, supplier=supplier,
-        date_from=date_from, date_to=date_to,
-        limit=limit, offset=offset,
-    )
-    total = await DocumentRepo.count_by_store(user.store_id, status=status)
-    return {"items": [d.to_dict() for d in docs], "total": total}
-
-
-@router.get("/{doc_id}")
-async def get_document(doc_id: int, user: User = Depends(get_current_user)):
-    doc = await DocumentRepo.get_by_id(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    if doc.store_id != user.store_id and not user.is_super_admin:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    items = await DocumentItemRepo.list_by_document(doc_id)
-    return {
-        "document": doc.to_dict(),
-        "items": [i.to_dict() for i in items],
-    }
-
-
-@router.get("/{doc_id}/image")
-async def get_document_image(doc_id: int, user: User = Depends(get_current_user)):
-    doc = await DocumentRepo.get_by_id(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    if doc.store_id != user.store_id and not user.is_super_admin:
-        raise HTTPException(status_code=403, detail="Access denied")
-    if not doc.original_file_url or not os.path.exists(doc.original_file_url):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(doc.original_file_url)
-
-
-@router.put("/{doc_id}/items/{item_id}")
-async def update_document_item(
-    doc_id: int,
-    item_id: int,
-    product_id: int | None = None,
-    quantity: float | None = None,
-    price: float | None = None,
-    create_alias: bool = False,
-    user: User = Depends(get_current_user),
-):
-    doc = await DocumentRepo.get_by_id(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    if doc.store_id != user.store_id and not user.is_super_admin:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    item = await DocumentItemRepo.get_by_id(item_id)
-    if not item or item.document_id != doc_id:
-        raise HTTPException(status_code=404, detail="Item not found")
-
-    old_value = item.to_dict()
-
-    if product_id is not None:
-        item.product_id = product_id
-        from core.repositories import ProductRepo
-        product = await ProductRepo.get_by_id(product_id)
-        if product:
-            item.product_name = product.name
-            item.article = product.article
-            item.barcode = product.barcode
-            item.unit = product.unit
-        item.match_status = "manual"
-    if quantity is not None:
-        item.quantity = quantity
-    if price is not None:
-        item.price = price
-    if item.quantity and item.price:
-        item.total = item.quantity * item.price
-
-    item = await DocumentItemRepo.update(item)
-
-    if create_alias and item.ocr_text and product_id:
-        from core.matching.service import normalize_text
-        from core.repositories import ProductAliasRepo
-        from core.models.product_alias import ProductAlias
-        alias = ProductAlias(
-            store_id=user.store_id,
-            product_id=product_id,
-            ocr_text=item.ocr_text,
-            normalized_text=normalize_text(item.ocr_text),
-            confidence=100.0,
-            created_by=user.id,
-        )
-        await ProductAliasRepo.create(alias)
-
-    await AuditLogRepo.create(AuditLog(
-        store_id=user.store_id,
-        user_id=user.id,
-        document_id=doc_id,
-        action="update_item",
-        entity_type="document_item",
-        entity_id=item_id,
-        old_value=old_value,
-        new_value=item.to_dict(),
-    ))
-
+@router.put('/{doc_id}/items/{item_id}')
+async def update_item(doc_id:int,item_id:int,req:ItemUpdate,user=Depends(require_store)):
+    async with get_transaction() as conn:
+        doc=await lock_document(doc_id,user,conn)
+        if doc.status not in ('needs_review','recognized','confirmed'):
+            raise HTTPException(409,'Дождитесь завершения распознавания')
+        item=await DocumentItemRepo.get_by_id(item_id)
+        if not item or item.document_id!=doc_id:
+            raise HTTPException(404,'Строка не найдена')
+        old=item.to_dict()
+        if req.product_id:
+            product=await ProductRepo.get_by_id(req.product_id)
+            if not product or product.store_id!=user.store_id or not product.is_active:
+                raise HTTPException(404,'Товар не найден в каталоге магазина')
+            item.product_id=product.id
+            item.product_name=product.name
+            item.article=product.article or ''
+            item.barcode=product.barcode or ''
+            item.unit=product.unit or ''
+            item.match_status='manual'
+            item.confidence=Decimal('100')
+        if req.quantity is not None:
+            item.quantity=req.quantity
+        if req.price is not None:
+            item.price=req.price
+        if item.quantity is not None and item.price is not None:
+            item.total=(Decimal(str(item.quantity))*Decimal(str(item.price))).quantize(Decimal('.01'),rounding=ROUND_HALF_UP)
+        item=await DocumentItemRepo.update(item)
+        if req.create_alias and req.product_id and item.ocr_text:
+            # The user explicitly teaches this store; other stores never see the alias.
+            normalized=normalize_text(item.ocr_text)
+            await conn.execute('UPDATE stores SET updated_at=updated_at WHERE id=$1',user.store_id)
+            await conn.execute('DELETE FROM product_aliases WHERE store_id=$1 AND normalized_text=$2',user.store_id,normalized)
+            await ProductAliasRepo.create(ProductAlias(store_id=user.store_id,product_id=req.product_id,ocr_text=item.ocr_text,normalized_text=normalized,confidence=Decimal('100'),created_by=user.id))
+        items=await DocumentItemRepo.list_by_document(doc_id)
+        good=sum(i.match_status in ('matched','manual') for i in items)
+        await DocumentRepo.update_counts(doc_id,len(items),good,len(items)-good)
+        await DocumentRepo.update_status(doc_id,'needs_review')
+        await audit(user,doc_id,'update_item',old,item.to_dict())
     return item.to_dict()
 
+async def reviewed_items(doc_id,store_id):
+    items=await DocumentItemRepo.list_by_document(doc_id)
+    if not items:
+        raise HTTPException(409,'В документе нет товаров')
+    result=[]
+    for item in items:
+        p=await ProductRepo.get_by_id(item.product_id) if item.product_id else None
+        if not p or p.store_id!=store_id or not p.is_active or item.match_status not in ('matched','manual'):
+            raise HTTPException(409,f'Строка {item.row_number}: выберите товар из каталога')
+        if item.quantity is None or item.price is None or item.total is None:
+            raise HTTPException(409,f'Строка {item.row_number}: заполните количество и цену')
+        quantity,price,total=map(lambda x:Decimal(str(x)),(item.quantity,item.price,item.total))
+        if not all(v.is_finite() for v in (quantity,price,total)) or quantity<=0 or price<0 or abs(quantity*price-total)>Decimal('.02'):
+            raise HTTPException(409,f'Строка {item.row_number}: проверьте количество, цену и сумму')
+        if item.product_name!=p.name or (item.unit or '')!=(p.unit or ''):
+            raise HTTPException(409,f'Строка {item.row_number}: каталог изменился, выберите товар заново')
+        result.append((item,p))
+    return result
 
-@router.post("/{doc_id}/confirm")
-async def confirm_document(doc_id: int, user: User = Depends(get_current_user)):
-    doc = await DocumentRepo.get_by_id(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    if doc.store_id != user.store_id and not user.is_super_admin:
-        raise HTTPException(status_code=403, detail="Access denied")
+@router.post('/{doc_id}/confirm')
+async def confirm(doc_id:int,user=Depends(require_store)):
+    async with get_transaction() as conn:
+        doc=await lock_document(doc_id,user,conn)
+        if doc.status not in ('recognized','needs_review','confirmed'):
+            raise HTTPException(409,'Документ ещё не готов к проверке')
+        await reviewed_items(doc_id,user.store_id)
+        await DocumentRepo.update_status(doc_id,'confirmed')
+        await audit(user,doc_id,'confirm')
+    return {'status':'confirmed'}
 
-    await DocumentRepo.update_status(doc_id, "confirmed")
-    await AuditLogRepo.create(AuditLog(
-        store_id=user.store_id,
-        user_id=user.id,
-        document_id=doc_id,
-        action="confirm",
-        entity_type="document",
-        entity_id=doc_id,
-    ))
-    return {"status": "confirmed"}
+def workbook_bytes(rows):
+    book=Workbook()
+    sheet=book.active
+    sheet.title='Накладная'
+    sheet.append(['Код 1С','Название','Артикул','Штрихкод','Количество','Цена','Сумма','Единица'])
+    for item,p in rows:
+        sheet.append([p.one_c_id,p.name,p.article or '',p.barcode or '',float(item.quantity),float(item.price),float(item.total),p.unit or ''])
+        for col in (1,2,3,4,8):
+            cell=sheet.cell(sheet.max_row,col)
+            cell.data_type='s'  # Untrusted OCR/catalog values must never become formulas.
+    for cell in sheet[1]:
+        cell.font=Font(bold=True,color='FFFFFF')
+        cell.fill=PatternFill('solid',fgColor='194C40')
+    for col,width in zip('ABCDEFGH',(24,55,20,22,15,15,15,14)):
+        sheet.column_dimensions[col].width=width
+    for row in sheet.iter_rows(min_row=2):
+        row[4].number_format='0.000'
+        row[5].number_format=row[6].number_format='0.00'
+    sheet.freeze_panes='A2'
+    sheet.auto_filter.ref=sheet.dimensions
+    buffer=BytesIO()
+    book.save(buffer)
+    return buffer.getvalue()
 
+@router.get('/{doc_id}/export')
+async def export(doc_id:int,user=Depends(require_store)):
+    async with get_transaction() as conn:
+        doc=await lock_document(doc_id,user,conn)
+        if doc.status!='confirmed':
+            raise HTTPException(409,'Сначала проверьте и подтвердите накладную')
+        rows=await reviewed_items(doc_id,user.store_id)
+        content=await asyncio.to_thread(workbook_bytes,rows)
+        await audit(user,doc_id,'export_excel')
+    return StreamingResponse(BytesIO(content),media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename="invoice-{doc_id}.xlsx"','Cache-Control':'private, no-store'})
 
-@router.post("/{doc_id}/retry")
-async def retry_document(doc_id: int, user: User = Depends(get_current_user)):
-    doc = await DocumentRepo.get_by_id(doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    if doc.store_id != user.store_id and not user.is_super_admin:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    await DocumentRepo.update_status(doc_id, "retry_pending")
-    return {"status": "retry_pending"}
-
-
-@router.get("/{doc_id}/audit")
-async def get_document_audit(doc_id: int, user: User = Depends(get_current_user)):
-    logs = await AuditLogRepo.list_by_document(doc_id)
-    return [l.to_dict() for l in logs]
+@router.get('/{doc_id}/audit')
+async def history(doc_id:int,user=Depends(require_store)):
+    await owned_document(doc_id,user)
+    return [entry.to_dict() for entry in await AuditLogRepo.list_by_document(doc_id)]

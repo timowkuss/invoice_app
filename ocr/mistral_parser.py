@@ -37,6 +37,8 @@ def _classify_column(header: str) -> str | None:
     """Определяет тип колонки по заголовку."""
     header_lower = header.lower().strip()
     # Сначала ищем более специфичные совпадения
+    if 'ндс' in header_lower and not any(word in header_lower for word in ('с ндс', 'включая ндс')):
+        return 'vat'
     for col_type in ("discount_price", "total", "vat", "unit", "quantity",
                      "barcode", "name", "price", "article"):
         keywords = _HEADER_KEYWORDS[col_type]
